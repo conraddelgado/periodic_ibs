@@ -197,8 +197,11 @@ class NumericalTests(unittest.TestCase):
         assert_allclose(moments.mean, [5 / 3, 8])
         assert_allclose(moments.variance, [8 / 9, 0])
         pooled = Moments((1,))
-        pooled.update(np.array([2.0]), 2, np.array([2.0]))  # samples 1,3
-        pooled.update(np.array([6.0]), 2, np.array([2.0]))  # samples 5,7
+        for group in ([1.0, 3.0], [5.0, 7.0]):
+            batch = Moments((1,))
+            for value in group:
+                batch.update(np.array([value]))
+            pooled.merge(batch)
         assert_allclose(pooled.mean, [4])
         assert_allclose(pooled.variance, [5])
 
