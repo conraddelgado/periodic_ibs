@@ -21,6 +21,7 @@ Welcome to the Multi-component Flow Code (MFC) documentation.
 
 - @ref examples "Example Cases" - Sample simulations
 - @ref visualization "Flow Visualization" - Post-processing
+- @ref volume_filtering "Volume-filtered Closures" - Offline particle-centered statistics
 
 ## Advanced Topics
 

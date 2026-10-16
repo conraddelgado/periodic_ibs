@@ -31,6 +31,7 @@ dependencies = [
 
     # Profiling
     "numpy",
+    "scipy",  # Offline volume filtering: FFTs and Fortran restart records
     "pandas",
 
     # Chemistry
