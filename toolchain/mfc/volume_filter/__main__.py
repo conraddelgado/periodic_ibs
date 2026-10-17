@@ -14,7 +14,7 @@ from .maps import Moments, ParticleMap
 from .numerics import Grid
 from .reader import Reader
 
-VERSION = 1
+VERSION = 2
 
 
 def atomic_save(path, arrays):
@@ -80,25 +80,37 @@ def validate(config):
 def pack(moments, metadata):
     yield "metadata", np.array(json.dumps(metadata, sort_keys=True))
     for key, value in moments.items():
+        yield key + ".count", value.count
         yield key + ".weight", value.weight
         yield key + ".mean", np.where(value.weight > 0, value.mean, np.nan)
-        yield key + ".m2", value.m2
+        for order in (2, 3, 4):
+            yield key + f".m{order}", getattr(value, f"m{order}")
+            yield key + f".central_moment{order}", value.central_moment(order)
+        for order in (1, 2, 3, 4):
+            yield key + f".raw_moment{order}", value.raw_moment(order)
         yield key + ".variance", value.variance
+        yield key + ".skewness", value.skewness
+        yield key + ".kurtosis", value.kurtosis
+        yield key + ".excess_kurtosis", value.kurtosis - 3
 
 
 def restore(path, digest):
     moments = {}
     with np.load(path, allow_pickle=False) as data:
         metadata = json.loads(str(data["metadata"]))
-        if metadata["version"] != VERSION or metadata["config_hash"] != digest:
-            raise ValueError("Checkpoint version/configuration mismatch; use a new output path")
+        if metadata["version"] != VERSION:
+            raise ValueError("Checkpoint version mismatch: moments 3-4 and realization counts require reprocessing the snapshots into a new output path")
+        if metadata["config_hash"] != digest:
+            raise ValueError("Checkpoint configuration mismatch; use a new output path")
         for key in data.files:
             if key.endswith(".weight"):
                 name = key[:-7]
                 result = Moments(data[key].shape)
                 result.weight = data[key].copy()
-                result.mean = np.nan_to_num(data[name + ".mean"], nan=0)
-                result.m2 = data[name + ".m2"].copy()
+                result.count = data[name + ".count"].copy()
+                result.mean = np.where(result.weight > 0, data[name + ".mean"], 0)
+                for order in (2, 3, 4):
+                    setattr(result, f"m{order}", data[name + f".m{order}"].copy())
                 moments[name] = result
     return moments, metadata
 
@@ -112,7 +124,15 @@ def run(config_path, resume=False, max_snapshots=None):
     mapper = ParticleMap(grid, config["map"])
     output = config_path.parent / config["output"]
     digest = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
-    metadata = {"version": VERSION, "config_hash": digest, "config": config, "completed": 0, "inputs": [], "particle_counts": []}
+    metadata = {
+        "version": VERSION,
+        "config_hash": digest,
+        "config": config,
+        "statistics": {"ensemble": "particle_timestep_pairs", "pooled_weighting": "equal_realizations", "max_order": 4, "normalization": "population", "kurtosis": "Pearson"},
+        "completed": 0,
+        "inputs": [],
+        "particle_counts": [],
+    }
     moments = {}
     if output.exists():
         if not resume:
@@ -143,12 +163,21 @@ def run(config_path, resume=False, max_snapshots=None):
                 particle = mapper.particles(field, particles)
                 key = f"sigma{sigma_index}.{name}"
                 valid_mean = np.where(particle.weight > 0, particle.mean, np.nan)
-                moments.setdefault(key + ".time", Moments(mapper.shape)).update(valid_mean, weights[index])
-                moments.setdefault(key + ".pooled", Moments(mapper.shape)).update(valid_mean, weights[index] * particle.weight, weights[index] * particle.m2)
+                # Keep time-series diagnostics distinct from the equally weighted
+                # particle/timestep ensemble, even for irregular snapshot times.
+                for suffix in (".time", ".pooled"):
+                    if key + suffix not in moments:
+                        moments[key + suffix] = Moments(mapper.shape)
+                moments[key + ".time"].update(valid_mean, weights[index])
+                moments[key + ".pooled"].merge(particle)
                 if config.get("save_snapshot_maps", False):
                     snapshot_maps[key + ".mean"] = valid_mean
                     snapshot_maps[key + ".particle_variance"] = particle.variance
-                    snapshot_maps[key + ".particle_count"] = particle.weight
+                    snapshot_maps[key + ".particle_count"] = particle.count
+                    snapshot_maps[key + ".particle_central_moment3"] = particle.central_moment(3)
+                    snapshot_maps[key + ".particle_central_moment4"] = particle.central_moment(4)
+                    snapshot_maps[key + ".particle_skewness"] = particle.skewness
+                    snapshot_maps[key + ".particle_kurtosis"] = particle.kurtosis
             if selected - seen:
                 raise ValueError(f"Unknown fields: {sorted(selected - seen)}")
         del state

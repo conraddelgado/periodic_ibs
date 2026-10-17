@@ -57,7 +57,10 @@ atomically after all filter widths and selected maps for a snapshot succeed.
 Resume checks the complete configuration, format version, and processed input
 paths/sizes/modification times. It does not re-count completed snapshots. Changing
 the configuration (including its snapshot list) requires a new output path.
-Keep the full planned snapshot list when using `--max-snapshots`. Only one job
+Version 2 checkpoints retain central sums through order four and realization
+counts. Version 1 checkpoints cannot be upgraded from means/variances alone;
+reprocess the raw snapshots into a new output file. Keep the full planned snapshot
+list when using `--max-snapshots`. Only one job
 may write a particular output path. Interrupted temporary files can be removed
 once that writer is no longer running. Raw input files are never deleted.
 
@@ -228,27 +231,79 @@ radial components can cancel. A future cylindrical-component or slip-aligned
 map should be a separate explicit choice. An incomplete ring is invalid rather
 than averaging only its valid angles. The axis is x=0, y=1, z=2.
 
+For the primary ensemble, **each valid particle/timestep pair is one equally
+weighted realization at each map location**. For a mapped closure component X,
+with N valid pairs, the population estimators are
+
+\f[
+\mu = \frac{1}{N}\sum_{t,p}X_{p,t}, \qquad
+c_r = \frac{1}{N}\sum_{t,p}(X_{p,t}-\mu)^r, \quad r=2,3,4.
+\f]
+
+Skewness is c3/c2^(3/2). Pearson kurtosis (flatness) is c4/c2^2; a Gaussian
+population has kurtosis 3. Excess kurtosis is kurtosis minus 3. Variance is c2,
+using N rather than N-1. These are empirical population moments, not bias-corrected
+estimates. Raw moments E[X^r] for orders 1-4 are also exported to make the
+meaning of "moment" unambiguous. The first central moment is identically zero;
+`mean` (first raw moment) is the useful first-order statistic.
+
+Particle realizations are accumulated before particle averaging. Snapshot batches
+are merged using their counts, means, and **all three central sums** M2, M3, M4;
+merging only particle-average maps would lose within-snapshot scatter. These
+pairwise formulas follow
+[Pebay, SAND2008-6212](https://doi.org/10.2172/1028931). They accumulate central
+sums directly rather than obtaining them by cancellation of large raw powers.
+The raw moments are derived only for output. All accumulators use float64, with
+int64 valid-realization counts, and memory remains independent of the number of
+snapshots. Two extra central-sum arrays and a count array are retained per
+accumulator; checkpoint entries are streamed instead of duplicating every derived
+output in memory.
+
 For each filter/component, the NPZ checkpoint contains:
 
-- `sigma0.R_u_xx.time.mean/variance/weight/m2`: mean and population variance over
-  instantaneous particle-average maps. Weight is the sum of valid time weights.
-- `sigma0.R_u_xx.pooled.mean/variance/weight/m2`: population statistics over
-  individual particle maps at all times, retaining within-snapshot particle
-  scatter. Weight sums time weight * valid particle count.
-- `metadata`: JSON containing the full configuration, filter widths, processed
-  count, particle counts, and input fingerprints. The map axes are in this JSON.
+| Suffix under `sigma0.R_u_xx.pooled` | Meaning |
+|---|---|
+| `.count` | Number of finite particle/timestep realizations at each map location |
+| `.weight` | Same as count for this equally weighted ensemble (legacy key retained) |
+| `.mean` | First raw moment |
+| `.variance`, `.central_moment2` | Second central moment |
+| `.central_moment3`, `.central_moment4` | Unstandardized third and fourth central moments |
+| `.skewness`, `.kurtosis`, `.excess_kurtosis` | Standardized shape statistics |
+| `.raw_moment1` through `.raw_moment4` | Raw moments E[X^r] |
+| `.m2`, `.m3`, `.m4` | Unnormalized central sums used for checkpoint/resume |
 
-All accumulators use float64 weighted Welford updates. No unbiased-variance or
-independent-sample claim is made: particles and times can be correlated.
-For axisymmetric maps, pooled variance measures variability of **ring averages**,
-not unresolved azimuthal fluctuations. Sample support may vary; compare weights.
-`time_weighting: "sample"` gives equal snapshot weights. `"trapezoid"` uses
-physical-time trapezoidal weights over the configured interval, including half
-intervals at its endpoints. Exclude startup transients in the snapshot list.
-This supplies moments, not an estimate of temporal autocorrelation or confidence
-intervals. `save_snapshot_maps: true` additionally writes one small NPZ per
-snapshot containing particle mean, particle variance, counts, and time. Those
-maps can support later stationarity/correlation studies without full DNS fields.
+An empty location has NaN mean/moments and zero count. A constant realization
+sequence has zero central moments and **NaN skewness/kurtosis**, because its
+variance is zero. Invalid samples are excluded separately at each location;
+inspect count maps rather than assuming every location has N_particles*N_times.
+For axisymmetric maps, one realization is a particle's **ring average** at one
+timestep: the azimuthal points are not counted as separate realizations. These
+statistics therefore exclude variability removed by the angular average.
+
+The existing `sigma0.R_u_xx.time.*` outputs remain separate diagnostics over
+instantaneous particle-average maps. They now expose the same moment fields,
+but their `.count` counts valid snapshots, not particle/timestep pairs. They
+must not be used as the pooled realization statistics.
+
+**`time_weighting` affects only `.time.*` diagnostics.** `"sample"` (the default
+and example) gives equal snapshot weights. `"trapezoid"` applies physical-time
+trapezoidal weights to those diagnostics. Neither changes `.pooled.*`: every
+particle/timestep pair has unit weight even when output times are irregular or
+particle counts change. This deliberately changes the old version-1 behavior,
+where trapezoidal weights also affected pooled statistics. Exclude startup
+transients in the configured snapshot list if a stationary ensemble is desired.
+
+`metadata` contains the full configuration, filter widths, processed count,
+particle counts, input fingerprints, and explicit ensemble/normalization
+conventions. Map coordinates remain in the configuration. Setting
+`save_snapshot_maps: true` additionally writes each snapshot's particle mean,
+variance, count, central moments 3-4, skewness, and Pearson kurtosis, together
+with the step/time. Those files can support later stationarity studies.
+
+The ensemble calculation treats particle/timestep pairs as distinct realizations.
+It does not demonstrate physical independence: nearby particles and closely
+spaced times may be correlated. No effective sample size, confidence intervals,
+or autocorrelation estimates are inferred from the stored counts.
 
 ```python
 import json
@@ -256,9 +311,14 @@ import numpy as np
 
 with np.load("closure_statistics.npz", allow_pickle=False) as data:
     metadata = json.loads(str(data["metadata"]))
-    mean = data["sigma0.R_u_xx.time.mean"]
-    temporal_variance = data["sigma0.R_u_xx.time.variance"]
-    pooled_variance = data["sigma0.R_u_xx.pooled.variance"]
+    prefix = "sigma0.R_u_xx.pooled"
+    count = data[prefix + ".count"]
+    mean = data[prefix + ".mean"]
+    variance = data[prefix + ".variance"]
+    skewness = data[prefix + ".skewness"]
+    kurtosis = data[prefix + ".kurtosis"]
+    third_central_moment = data[prefix + ".central_moment3"]
+    fourth_raw_moment = data[prefix + ".raw_moment4"]
 ```
 
 ## Validation
@@ -266,13 +326,16 @@ with np.load("closure_statistics.npz", allow_pickle=False) as data:
 Run the focused suite without compiling MFC:
 
 ```bash
-PYTHONPATH=toolchain python -m unittest mfc.volume_filter.test_volume_filter -v
+PYTHONPATH=toolchain python -m unittest mfc.volume_filter.test_volume_filter mfc.volume_filter.test_moments -v
 ```
 
 It exercises Fourier-mode attenuation, filtered momentum and energy identities,
 fluid-only differences, periodic registration, conservative deposition, analytic
 surface-force/power integrals, map statistics, shared/sharded/Fortran-record input,
-and equality of uninterrupted versus checkpoint/resume processing. These tests
+and equality of uninterrupted versus checkpoint/resume processing. Higher-moment
+tests compare streamed and unevenly grouped data with direct sample statistics,
+including nonzero skewness, large mean offsets, missing/constant data, variable
+particle counts, irregular times, and legacy-checkpoint rejection. These tests
 establish numerical contracts; they do not replace a DNS comparison or a grid/
 filter/quadrature convergence study. For complete equation-balance tests, also
 include the simulation's external forcing and enough snapshots to estimate time
