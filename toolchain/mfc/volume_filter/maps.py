@@ -98,23 +98,40 @@ class ParticleMap:
         self.grid, self.config = grid, config
         self.mode = config["kind"]
         if self.mode == "box":
-            axes = [np.asarray(config[name], dtype=float) for name in ("x", "y", "z")]
-            if any(a.ndim != 1 or a.size == 0 or not np.all(np.isfinite(a)) for a in axes):
-                raise ValueError("Box map axes must be finite nonempty lists")
-            self.shape = tuple(len(a) for a in axes)
-            self.offsets = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+            if any(name in config for name in ("x", "y", "z")):
+                raise ValueError("Replace box map x/y/z lists with one length and one points count")
+            length, points = config.get("length"), config.get("points")
+            if isinstance(length, bool) or not isinstance(length, (int, float)) or not np.isfinite(length) or length <= 0:
+                raise ValueError("Box map length must be a finite positive scalar side length")
+            if type(points) is not int or points < 2:
+                raise ValueError("Box map points must be an integer >= 2 per direction")
+            if length >= min(grid.lengths):
+                raise ValueError("Box map length must be smaller than every periodic domain length")
+            axis = np.linspace(-length / 2, length / 2, points)
+            self.shape = (points, points, points)
+            self.offsets = np.stack(np.meshgrid(axis, axis, axis, indexing="ij"), axis=-1).reshape(-1, 3)
         elif self.mode == "axisymmetric":
-            axial = np.asarray(config["axial"], dtype=float)
-            radial = np.asarray(config["radial"], dtype=float)
+            if any(name in config for name in ("axial", "radial")):
+                raise ValueError("Replace axial/radial lists with axial_length, axial_points, radius, and radial_points")
+            length, radius = config.get("axial_length"), config.get("radius")
+            for name, value in (("axial_length", length), ("radius", radius)):
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value <= 0:
+                    raise ValueError(f"Axisymmetric {name} must be a finite positive scalar")
+            nx, nr = config.get("axial_points"), config.get("radial_points")
             ntheta = config.get("azimuthal_points", 32)
+            for name, count, minimum in (("axial_points", nx, 2), ("radial_points", nr, 2), ("azimuthal_points", ntheta, 4)):
+                if type(count) is not int or count < minimum:
+                    raise ValueError(f"Axisymmetric {name} must be an integer >= {minimum}")
             axis = config.get("axis", 0)
-            if axis not in (0, 1, 2) or not isinstance(ntheta, int) or ntheta < 4:
-                raise ValueError("Invalid axis or azimuthal_points")
-            if axial.ndim != 1 or radial.ndim != 1 or not axial.size or not radial.size or not np.all(np.isfinite(axial)) or not np.all(np.isfinite(radial)) or np.any(radial < 0):
-                raise ValueError("Invalid axial/radial map coordinates")
+            if type(axis) is not int or axis not in (0, 1, 2):
+                raise ValueError("Axisymmetric axis must be 0, 1, or 2")
+            transverse = [i for i in range(3) if i != axis]
+            if length >= grid.lengths[axis] or 2 * radius >= min(grid.lengths[i] for i in transverse):
+                raise ValueError("Axisymmetric axial_length and diameter must fit inside their periodic domain lengths")
+            axial = np.linspace(-length / 2, length / 2, nx)
+            radial = np.linspace(0, radius, nr)
             x, r, theta = np.meshgrid(axial, radial, np.arange(ntheta) * (2 * np.pi / ntheta), indexing="ij")
             offsets = np.zeros((*x.shape, 3))
-            transverse = [i for i in range(3) if i != axis]
             offsets[..., axis] = x
             offsets[..., transverse[0]] = r * np.cos(theta)
             offsets[..., transverse[1]] = r * np.sin(theta)

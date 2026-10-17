@@ -120,7 +120,7 @@ class MomentTests(unittest.TestCase):
             root = Path(directory)
             (root / "restart_data").mkdir()
             cfg = config()
-            cfg.update(fields=["F_x"], map={"kind": "box", "x": [0], "y": [0], "z": [0]})
+            cfg.update(fields=["F_x"], map={"kind": "box", "length": 0.125, "points": 3})
             times = [0.0, 1.0, 4.0]
             cfg["snapshots"] = [0, 1, 2]
             positions = [[0.28125], [0.28125, 0.40625, 0.65625], [0.40625, 0.78125]]
@@ -157,15 +157,16 @@ class MomentTests(unittest.TestCase):
                     with np.load(root / f"{mode}.step2.npz") as snapshot:
                         self.assertEqual(json.loads(str(snapshot["metadata"]))["time"], 4.0)
                     prefix = "sigma0.F_x.pooled"
-                    self.assertEqual(data[prefix + ".count"].item(), 6)
-                    reference = accumulate(np.array(expected).reshape(-1, 1, 1, 1))
-                    self.assert_direct(reference, np.array(expected).reshape(-1, 1, 1, 1))
+                    assert_array_equal(data[prefix + ".count"], np.full((3, 3, 3), 6))
+                    samples = np.broadcast_to(np.array(expected)[:, None, None, None] + np.linspace(-0.0625, 0.0625, 3)[None, :, None, None], (6, 3, 3, 3))
+                    reference = accumulate(samples)
+                    self.assert_direct(reference, samples)
                     for name in ("mean", "variance", "skewness", "kurtosis"):
                         assert_allclose(data[prefix + "." + name], getattr(reference, name), atol=1e-12)
                     for order in (1, 2, 3, 4):
-                        assert_allclose(data[prefix + f".raw_moment{order}"], np.mean(np.array(expected) ** order))
+                        assert_allclose(data[prefix + f".raw_moment{order}"], np.mean(samples**order, axis=0))
                     outputs.append({key: data[key].copy() for key in data.files if ".pooled." in key})
-                    self.assertNotAlmostEqual(data[prefix + ".variance"].item(), data["sigma0.F_x.time.variance"].item())
+                    self.assertNotAlmostEqual(data[prefix + ".variance"][1, 1, 1], data["sigma0.F_x.time.variance"][1, 1, 1])
             for key in outputs[0]:
                 assert_allclose(outputs[0][key], outputs[1][key])
 
