@@ -253,20 +253,45 @@ The cube side length must be strictly smaller than every periodic domain length
 to avoid repeated periodic images at its endpoints. Axisymmetric offsets must
 also remain inside half the domain size.
 
-An alternative is:
+For an axisymmetric map, use independent axial, radial, and angular counts:
 
 ```json
 {
   "kind": "axisymmetric",
   "axis": 0,
-  "axial": [-0.1, 0.0, 0.1, 0.2],
-  "radial": [0.0, 0.025, 0.05, 0.1],
+  "axial_length": 0.2,
+  "axial_points": 21,
+  "radius": 0.1,
+  "radial_points": 11,
   "azimuthal_points": 32
 }
 ```
 
-This averages uniformly spaced angular samples on each (axial,radial) ring,
-then averages particles. **Components remain Cartesian**; this is not a
+`axial_length` is the full axial extent centered on the particle; `radius` is the
+maximum radial distance from the axis (not the particle radius). Both use the
+simulation's coordinate units. The code constructs a cylindrical meshgrid from:
+
+- Axial: `np.linspace(-axial_length/2, axial_length/2, axial_points)`.
+- Radial: `np.linspace(0, radius, radial_points)`.
+- Angular: `np.arange(azimuthal_points) * 2*np.pi/azimuthal_points`.
+
+Axial and radial endpoints are included. Theta covers the full circle in radians,
+with 2*pi excluded to avoid counting the same angle twice. The three counts are
+independent: axial/radial counts must be integers >= 2, and the angular count
+must be >= 4 (default 32). An odd axial count includes the center plane. The
+axial length must be smaller than the domain length along `axis`, and twice the
+radial extent must be smaller than both transverse domain lengths.
+
+The mesh is translated to each particle's current center, with periodic
+trilinear interpolation of the closure fields. Each (axial,radial) ring is
+averaged over theta before particle/timestep statistics are accumulated. The
+example samples 21 x 11 x 32 locations per particle and returns 21 x 11 statistic
+maps. Repeated angular samples at r=0 still contribute just one ring realization.
+A complete configuration is provided in
+`misc/volume_filter/config.axisymmetric.example.json`. Legacy `axial`/`radial`
+coordinate lists must be replaced with the extent/count parameters above.
+
+ **Components remain Cartesian**; this is not a
 cylindrical-component tensor/vector transform. The angularly averaged Cartesian
 radial components can cancel. A future cylindrical-component or slip-aligned
 map should be a separate explicit choice. An incomplete ring is invalid rather
@@ -335,8 +360,8 @@ transients by selecting the desired saved file indices.
 `metadata` contains the full configuration, filter widths, processed count,
 particle counts, file-derived `snapshot_times`, input fingerprints, and explicit ensemble/normalization
 conventions. Box coordinates can be reconstructed from `config["map"]["length"]`
-and `config["map"]["points"]` using the linspace above; axisymmetric coordinates
-remain in the configuration. Setting
+and `config["map"]["points"]` using the linspace above. Axisymmetric coordinates
+can likewise be reconstructed from the stored extent/count parameters. Setting
 `save_snapshot_maps: true` additionally writes each snapshot's particle mean,
 variance, count, central moments 3-4, skewness, and Pearson kurtosis, together
 with the step/time. Those files can support later stationarity studies.
