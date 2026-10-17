@@ -98,11 +98,18 @@ class ParticleMap:
         self.grid, self.config = grid, config
         self.mode = config["kind"]
         if self.mode == "box":
-            axes = [np.asarray(config[name], dtype=float) for name in ("x", "y", "z")]
-            if any(a.ndim != 1 or a.size == 0 or not np.all(np.isfinite(a)) for a in axes):
-                raise ValueError("Box map axes must be finite nonempty lists")
-            self.shape = tuple(len(a) for a in axes)
-            self.offsets = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+            if any(name in config for name in ("x", "y", "z")):
+                raise ValueError("Replace box map x/y/z lists with one length and one points count")
+            length, points = config.get("length"), config.get("points")
+            if isinstance(length, bool) or not isinstance(length, (int, float)) or not np.isfinite(length) or length <= 0:
+                raise ValueError("Box map length must be a finite positive scalar side length")
+            if type(points) is not int or points < 2:
+                raise ValueError("Box map points must be an integer >= 2 per direction")
+            if length >= min(grid.lengths):
+                raise ValueError("Box map length must be smaller than every periodic domain length")
+            axis = np.linspace(-length / 2, length / 2, points)
+            self.shape = (points, points, points)
+            self.offsets = np.stack(np.meshgrid(axis, axis, axis, indexing="ij"), axis=-1).reshape(-1, 3)
         elif self.mode == "axisymmetric":
             axial = np.asarray(config["axial"], dtype=float)
             radial = np.asarray(config["radial"], dtype=float)

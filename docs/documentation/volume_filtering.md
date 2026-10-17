@@ -223,13 +223,35 @@ not cancel pointwise at finite resolution.
 
 ## Maps and statistics
 
-`map.kind: "box"` samples the Cartesian product of supplied x/y/z offsets about
-each particle, using periodic trilinear interpolation. This produces a spatial
-map; it does not collapse the entire box to one number. Offsets are in fixed
-physical length units, **not radius-normalized**, and axes remain laboratory axes.
+A box map uses one cube side length and one point count shared by all directions:
+
+```json
+"map": {
+  "kind": "box",
+  "length": 0.2,
+  "points": 21
+}
+```
+
+`length` is the full side length in simulation coordinate units, **not a half-width
+or a particle-diameter multiple**. `points` is an integer >= 2 giving the number
+of points per direction. The code constructs
+`axis = np.linspace(-length/2, length/2, points)` and a 3D meshgrid with
+`indexing="ij"`. Both endpoints are included, with spacing `length/(points-1)`.
+Odd point counts include the particle center; even counts straddle it symmetrically.
+The example gives a 21 x 21 x 21 map spanning -0.1 to +0.1 in each direction.
+
+At each snapshot the cube is translated to each particle's current center, and
+the full-domain closure fields are sampled using periodic trilinear interpolation.
+Each output statistic has shape `(points, points, points)` in x/y/z order. This
+produces a spatial map; it does not collapse the cube to one number. Axes remain
+laboratory axes. The old independent x/y/z lists are no longer accepted; replace
+them with `length` and `points`, and use a new output path for the changed map.
 All particles have equal weight, including when radii differ. Filters include the
 entire suspension; a neighborhood overlapping another particle is intentional.
-Offsets must remain inside half the domain size to avoid repeated periodic images.
+The cube side length must be strictly smaller than every periodic domain length
+to avoid repeated periodic images at its endpoints. Axisymmetric offsets must
+also remain inside half the domain size.
 
 An alternative is:
 
@@ -312,7 +334,9 @@ transients by selecting the desired saved file indices.
 
 `metadata` contains the full configuration, filter widths, processed count,
 particle counts, file-derived `snapshot_times`, input fingerprints, and explicit ensemble/normalization
-conventions. Map coordinates remain in the configuration. Setting
+conventions. Box coordinates can be reconstructed from `config["map"]["length"]`
+and `config["map"]["points"]` using the linspace above; axisymmetric coordinates
+remain in the configuration. Setting
 `save_snapshot_maps: true` additionally writes each snapshot's particle mean,
 variance, count, central moments 3-4, skewness, and Pearson kurtosis, together
 with the step/time. Those files can support later stationarity studies.
@@ -347,7 +371,8 @@ PYTHONPATH=toolchain python -m unittest mfc.volume_filter.test_volume_filter mfc
 ```
 
 It exercises Fourier-mode attenuation, filtered momentum and energy identities,
-fluid-only differences, periodic registration, conservative deposition, analytic
+fluid-only differences, cubic mesh construction, affine interpolation, periodic
+particle registration, conservative deposition, analytic
 surface-force/power integrals, map statistics, shared/sharded/Fortran-record input,
 and equality of uninterrupted versus checkpoint/resume processing. Higher-moment
 tests compare streamed and unevenly grouped data with direct sample statistics,

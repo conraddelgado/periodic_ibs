@@ -47,7 +47,7 @@ def config():
             "particles": "restart_data/ib_state_{step}.dat",
         },
         "sigmas": [0.1],
-        "map": {"kind": "box", "x": [-0.1, 0, 0.1], "y": [0], "z": [0]},
+        "map": {"kind": "box", "length": 0.2, "points": 3},
         "snapshots": [1, 2],
         "output": "stats.npz",
         "fields": ["alpha", "R_u_xx", "F_x"],
@@ -185,6 +185,43 @@ class NumericalTests(unittest.TestCase):
         constant = conservative(rho, velocity, np.ones(grid.shape))
         moved = dict(closure_fields(grid, reconstruct(grid, iter(constant), shifted, PHYSICS), shifted, 0.08, {"surface": SURFACE}))
         assert_allclose(moved["F_x"], np.roll(base["F_x"], 3, axis=0), atol=1e-13)
+
+    def test_cubic_map_interpolation_and_periodic_centers(self):
+        grid = Grid((20, 20, 20), (1, 1, 1))
+        mapper = ParticleMap(grid, {"kind": "box", "length": 0.1, "points": 3})
+        self.assertEqual(mapper.shape, (3, 3, 3))
+        offsets = mapper.offsets.reshape(3, 3, 3, 3)
+        for dimension in range(3):
+            axis_slice = [0, 0, 0, dimension]
+            axis_slice[dimension] = slice(None)
+            assert_allclose(offsets[tuple(axis_slice)], [-0.05, 0, 0.05])
+        centers = (np.arange(20) + 0.5) / 20
+        x, y, z = np.meshgrid(centers, centers, centers, indexing="ij")
+        field = x + 2 * y + 3 * z
+        center = np.array([0.41, 0.53, 0.62])
+        coordinates = offsets + center
+        expected = coordinates[..., 0] + 2 * coordinates[..., 1] + 3 * coordinates[..., 2]
+        result = mapper.particles(field, particles(center=center))
+        assert_allclose(result.mean, expected, atol=1e-14)
+        assert_allclose(result.count, 1)
+        # The same moving center on either side of the periodic boundary.
+        wrapped = mapper.particles(field, particles(center=(0.98, 0.5, 0.5)))
+        equivalent = mapper.particles(field, particles(center=(-0.02, 0.5, 0.5)))
+        assert_allclose(wrapped.mean, equivalent.mean, atol=1e-14)
+        assert_allclose(wrapped.mean[-1], 0.03 + 2 * (0.5 + offsets[-1, ..., 1]) + 3 * (0.5 + offsets[-1, ..., 2]), atol=1e-14)
+
+    def test_cubic_map_validation_and_even_spacing(self):
+        grid = Grid((20, 20, 20), (1, 1, 1))
+        mapper = ParticleMap(grid, {"kind": "box", "length": 0.3, "points": 4})
+        assert_allclose(mapper.offsets.reshape(4, 4, 4, 3)[:, 0, 0, 0], [-0.15, -0.05, 0.05, 0.15])
+        for length in (None, True, [0.2], 0, -1, np.nan, np.inf, 1, 2):
+            with self.assertRaisesRegex(ValueError, "length"):
+                ParticleMap(grid, {"kind": "box", "length": length, "points": 3})
+        for points in (None, True, 0, 1, -1, 3.5, [3, 3, 3]):
+            with self.assertRaisesRegex(ValueError, "points"):
+                ParticleMap(grid, {"kind": "box", "length": 0.2, "points": points})
+        with self.assertRaisesRegex(ValueError, "Replace"):
+            ParticleMap(grid, {"kind": "box", "x": [0], "y": [0], "z": [0]})
 
     def test_axisymmetric_map_and_moments(self):
         grid = Grid((20, 20, 20), (1, 1, 1))
