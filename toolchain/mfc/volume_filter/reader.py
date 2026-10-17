@@ -74,7 +74,7 @@ class Reader:
     def fingerprint(self, step):
         return [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in self.input_paths(step)]
 
-    def particles(self, step, time):
+    def particles(self, step):
         if not self.config.get("particle_shards", False):
             path = self.path(self.config["particles"], step)
             if path.stat().st_size % (20 * self.particle_dtype.itemsize):
@@ -107,8 +107,6 @@ class Reader:
             states = np.array([rows[key] for key in sorted(rows)], dtype=float)
         if not np.all(np.isfinite(states)) or np.any(states[:, 19] <= 0):
             raise ValueError("Invalid particle state; check precision and missing records")
-        if not np.allclose(states[:, 0], time, rtol=1e-9, atol=1e-12):
-            raise ValueError(f"Particle time does not match requested snapshot time {time}")
         return states
 
     def fields(self, step):
