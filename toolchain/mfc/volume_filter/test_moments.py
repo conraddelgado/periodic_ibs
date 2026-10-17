@@ -121,14 +121,15 @@ class MomentTests(unittest.TestCase):
             (root / "restart_data").mkdir()
             cfg = config()
             cfg.update(fields=["F_x"], map={"kind": "box", "x": [0], "y": [0], "z": [0]})
-            cfg["snapshots"] = [{"step": i, "time": time} for i, time in enumerate([0.0, 1.0, 4.0])]
+            times = [0.0, 1.0, 4.0]
+            cfg["snapshots"] = [0, 1, 2]
             positions = [[0.28125], [0.28125, 0.40625, 0.65625], [0.40625, 0.78125]]
             expected = []
             for i, centers in enumerate(positions):
                 (root / f"restart_data/{i}.dat").write_bytes(b"fixture")
-                states = np.concatenate([particles(center=(x, 0.5, 0.5), time=cfg["snapshots"][i]["time"]) for x in centers])
+                states = np.concatenate([particles(center=(x, 0.5, 0.5), time=times[i]) for x in centers])
                 states.tofile(root / f"restart_data/ib_state_{i}.dat")
-                expected.extend([10 * cfg["snapshots"][i]["time"] + x for x in centers])
+                expected.extend([10 * times[i] + x for x in centers])
 
             def synthetic_fields(grid, state, states, sigma, options):
                 x = (np.arange(grid.shape[0]) + 0.5) * grid.dx[0]
@@ -136,14 +137,25 @@ class MomentTests(unittest.TestCase):
                 yield "F_x", field
 
             outputs = []
-            for mode in ("sample", "trapezoid"):
-                cfg.update(time_weighting=mode, output=f"{mode}.npz")
+            for mode in ("steps", "legacy"):
+                cfg["output"] = f"{mode}.npz"
+                if mode == "legacy":
+                    cfg.update(snapshots=[{"step": i, "time": 0.001} for i in range(3)], time_weighting="trapezoid")
                 path = root / "config.json"
                 path.write_text(json.dumps(cfg))
                 with patch("mfc.volume_filter.__main__.reconstruct", return_value=None), patch("mfc.volume_filter.__main__.closure_fields", side_effect=synthetic_fields):
                     run(path, max_snapshots=1)
+                    # Resume also accepts equivalent legacy syntax with stale times.
+                    cfg["snapshots"] = [{"step": i, "time": -999} for i in range(3)]
+                    path.write_text(json.dumps(cfg))
                     run(path, resume=True)
                 with np.load(root / cfg["output"]) as data:
+                    metadata = json.loads(str(data["metadata"]))
+                    self.assertEqual(metadata["snapshot_times"], times)
+                    self.assertEqual(metadata["config"]["snapshots"], [0, 1, 2])
+                    assert_allclose(data["sigma0.F_x.time.weight"], 3)
+                    with np.load(root / f"{mode}.step2.npz") as snapshot:
+                        self.assertEqual(json.loads(str(snapshot["metadata"]))["time"], 4.0)
                     prefix = "sigma0.F_x.pooled"
                     self.assertEqual(data[prefix + ".count"].item(), 6)
                     reference = accumulate(np.array(expected).reshape(-1, 1, 1, 1))

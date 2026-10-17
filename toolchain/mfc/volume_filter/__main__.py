@@ -58,23 +58,16 @@ def validate(config):
     if sigmas.ndim != 1 or not len(sigmas) or not np.all(np.isfinite(sigmas)) or np.any(sigmas <= 0) or len(set(sigmas)) != len(sigmas):
         raise ValueError("sigmas must be distinct positive standard deviations")
     snapshots = config["snapshots"]
-    if not snapshots:
+    if not isinstance(snapshots, list) or not snapshots:
         raise ValueError("Provide at least one snapshot")
-    times = np.array([item["time"] for item in snapshots], dtype=float)
-    steps = [item["step"] for item in snapshots]
-    if not np.all(np.isfinite(times)) or np.any(np.diff(times) <= 0) or len(set(steps)) != len(steps):
-        raise ValueError("Snapshot times must increase strictly and steps must be unique")
-    if any(not isinstance(step, int) or step < 0 for step in steps):
+    steps = [item.get("step") if isinstance(item, dict) else item for item in snapshots]
+    if any(type(step) is not int or step < 0 for step in steps):
         raise ValueError("Snapshot steps must be nonnegative integers (MFC save indices)")
-    weighting = config.get("time_weighting", "sample")
-    if weighting == "sample":
-        return np.ones(len(times))
-    if weighting != "trapezoid" or len(times) < 2:
-        raise ValueError("time_weighting must be sample, or trapezoid with >=2 snapshots")
-    weights = np.empty(len(times))
-    weights[0], weights[-1] = (times[1] - times[0]) / 2, (times[-1] - times[-2]) / 2
-    weights[1:-1] = (times[2:] - times[:-2]) / 2
-    return weights
+    if len(set(steps)) != len(steps):
+        raise ValueError("Snapshot steps must be unique")
+    # Normalize legacy objects before hashing; physical times are not inputs.
+    config["snapshots"] = steps
+    config.pop("time_weighting", None)
 
 
 def pack(moments, metadata):
@@ -118,7 +111,7 @@ def restore(path, digest):
 def run(config_path, resume=False, max_snapshots=None):
     config_path = Path(config_path).resolve()
     config = json.loads(config_path.read_text())
-    weights = validate(config)
+    validate(config)
     grid = Grid(**config["grid"])
     reader = Reader(config["io"], grid, config_path.parent)
     mapper = ParticleMap(grid, config["map"])
@@ -128,18 +121,26 @@ def run(config_path, resume=False, max_snapshots=None):
         "version": VERSION,
         "config_hash": digest,
         "config": config,
-        "statistics": {"ensemble": "particle_timestep_pairs", "pooled_weighting": "equal_realizations", "max_order": 4, "normalization": "population", "kurtosis": "Pearson"},
+        "statistics": {
+            "ensemble": "particle_timestep_pairs",
+            "pooled_weighting": "equal_realizations",
+            "snapshot_weighting": "equal_snapshots",
+            "max_order": 4,
+            "normalization": "population",
+            "kurtosis": "Pearson",
+        },
         "completed": 0,
         "inputs": [],
         "particle_counts": [],
+        "snapshot_times": [],
     }
     moments = {}
     if output.exists():
         if not resume:
             raise FileExistsError(f"{output} exists; use --resume or select a new output")
         moments, metadata = restore(output, digest)
-        for snapshot, previous in zip(config["snapshots"], metadata["inputs"]):
-            if json.loads(json.dumps(reader.fingerprint(snapshot["step"]))) != previous:
+        for step, previous in zip(config["snapshots"], metadata["inputs"]):
+            if json.loads(json.dumps(reader.fingerprint(step))) != previous:
                 raise ValueError("A previously processed input file changed")
     elif resume:
         raise FileNotFoundError(f"Cannot resume missing checkpoint {output}")
@@ -147,10 +148,10 @@ def run(config_path, resume=False, max_snapshots=None):
     start = metadata["completed"]
     end = len(config["snapshots"]) if max_snapshots is None else min(len(config["snapshots"]), start + max_snapshots)
     for index in range(start, end):
-        snapshot = config["snapshots"][index]
-        step, time = snapshot["step"], snapshot["time"]
+        step = config["snapshots"][index]
         fingerprint = reader.fingerprint(step)
-        particles = reader.particles(step, time)
+        particles = reader.particles(step)
+        time = float(particles[0, 0])  # File timestamp is descriptive metadata only.
         state = reconstruct(grid, reader.fields(step), particles, config["physics"])
         print(f"Snapshot {index + 1}/{len(config['snapshots'])}: step={step}, time={time}, particles={len(particles)}", flush=True)
         snapshot_maps = {}
@@ -168,7 +169,7 @@ def run(config_path, resume=False, max_snapshots=None):
                 for suffix in (".time", ".pooled"):
                     if key + suffix not in moments:
                         moments[key + suffix] = Moments(mapper.shape)
-                moments[key + ".time"].update(valid_mean, weights[index])
+                moments[key + ".time"].update(valid_mean)
                 moments[key + ".pooled"].merge(particle)
                 if config.get("save_snapshot_maps", False):
                     snapshot_maps[key + ".mean"] = valid_mean
@@ -186,6 +187,7 @@ def run(config_path, resume=False, max_snapshots=None):
         metadata["completed"] = index + 1
         metadata["inputs"].append(fingerprint)
         metadata["particle_counts"].append(len(particles))
+        metadata["snapshot_times"].append(time)
         if snapshot_maps:
             snapshot_maps["metadata"] = np.array(json.dumps({"config_hash": digest, "step": step, "time": time}))
             atomic_save(output.with_name(f"{output.stem}.step{step}.npz"), snapshot_maps)

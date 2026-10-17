@@ -48,7 +48,7 @@ def config():
         },
         "sigmas": [0.1],
         "map": {"kind": "box", "x": [-0.1, 0, 0.1], "y": [0], "z": [0]},
-        "snapshots": [{"step": 1, "time": 1.0}, {"step": 2, "time": 2.0}],
+        "snapshots": [1, 2],
         "output": "stats.npz",
         "fields": ["alpha", "R_u_xx", "F_x"],
         "save_snapshot_maps": True,
@@ -220,9 +220,7 @@ class ReaderAndPipelineTests(unittest.TestCase):
             reader = Reader(settings, grid, root)
             for actual, expected in zip(reader.fields(1), fields):
                 assert_allclose(actual, expected)
-            assert_allclose(reader.particles(1, 0.4), part)
-            with self.assertRaisesRegex(ValueError, "time"):
-                reader.particles(1, 0.5)
+            assert_allclose(reader.particles(1), part)
             blocks = [{"offset": [4 * rank, 0, 0], "shape": [4, 6, 6], "rank": rank} for rank in range(2)]
             for rank in range(2):
                 local = [f[4 * rank : 4 * (rank + 1)] for f in fields]
@@ -240,7 +238,7 @@ class ReaderAndPipelineTests(unittest.TestCase):
                 reader = Reader(settings, grid, root)
                 for actual, expected in zip(reader.fields(1), fields):
                     assert_allclose(actual, expected)
-                assert_allclose(reader.particles(1, 0.4), part)
+                assert_allclose(reader.particles(1), part)
             settings["blocks"][1]["offset"] = [3, 0, 0]
             with self.assertRaisesRegex(ValueError, "Overlapping"):
                 Reader(settings, grid, root)
@@ -262,7 +260,9 @@ class ReaderAndPipelineTests(unittest.TestCase):
             run(config_path, resume=True)
             with np.load(root / "stats.npz") as data:
                 resumed = {key: data[key].copy() for key in data.files if key != "metadata"}
-                self.assertEqual(json.loads(str(data["metadata"]))["completed"], 2)
+                metadata = json.loads(str(data["metadata"]))
+                self.assertEqual(metadata["completed"], 2)
+                self.assertEqual(metadata["snapshot_times"], [1.0, 2.0])
             cfg["output"] = "single.npz"
             config_path.write_text(json.dumps(cfg))
             run(config_path)
@@ -276,11 +276,19 @@ class ReaderAndPipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "mismatch"):
                 run(config_path, resume=True)
 
-    def test_time_weights_and_unsupported_physics(self):
+    def test_snapshot_steps_and_unsupported_physics(self):
+        for snapshots in ([0, 1, 4], [{"step": 0}, {"step": 1}, {"step": 4}], [{"step": i, "time": "ignored"} for i in (0, 1, 4)]):
+            cfg = config()
+            cfg.update(snapshots=snapshots, time_weighting="trapezoid")
+            validate(cfg)
+            self.assertEqual(cfg["snapshots"], [0, 1, 4])
+            self.assertNotIn("time_weighting", cfg)
+        for snapshots in ([], [1, 1], [True], [-1], [1.5], [{}], ["1"]):
+            cfg = config()
+            cfg["snapshots"] = snapshots
+            with self.assertRaises(ValueError):
+                validate(cfg)
         cfg = config()
-        cfg["snapshots"] = [{"step": i, "time": t} for i, t in enumerate([0, 1, 4])]
-        cfg["time_weighting"] = "trapezoid"
-        assert_allclose(validate(cfg), [0.5, 2, 1.5])
         cfg["periodic"] = [True, False, True]
         with self.assertRaisesRegex(ValueError, "periodic"):
             validate(cfg)

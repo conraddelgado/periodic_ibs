@@ -22,11 +22,7 @@
     "flow": "restart_data/{step}.dat",
     "particles": "restart_data/ib_state_{step}.dat"
   },
-  "snapshots": [
-    {"step": 1000, "time": 0.001},
-    {"step": 2000, "time": 0.002},
-    {"step": 3000, "time": 0.003}
-  ],
+  "snapshots": [1000, 2000, 3000],
   "sigmas": [0.025, 0.05],
   "alpha_min": 0.000001,
   "fft_workers": 4,
@@ -42,7 +38,6 @@
     "y": [-0.1, -0.05, 0.0, 0.05, 0.1],
     "z": [-0.1, -0.05, 0.0, 0.05, 0.1]
   },
-  "time_weighting": "sample",
   "save_snapshot_maps": true,
   "output": "closure_statistics.npz"
 }

@@ -31,11 +31,11 @@ From the repository root, using Python with NumPy and SciPy installed:
 
 ```bash
 cp misc/volume_filter/config.example.json /path/to/case/closures.json
-# Edit the copied configuration to match the actual simulation and output times.
+# Edit the copied configuration to match the actual simulation and saved file indices.
 PYTHONPATH=toolchain python -m mfc.volume_filter /path/to/case/closures.json
 ```
 
-The example's gas constants, mesh, indices, times, and filter widths are
+The example's gas constants, mesh, indices, and filter widths are
 illustrative, not inferred from a case. All paths are relative to the JSON file.
 Use mutually consistent dimensional or nondimensional units. In particular,
 `mu` is the dynamic viscosity used in tau = mu*S(u), **not MFC's Reynolds number
@@ -109,9 +109,28 @@ precision/endianness and can differ. The default shared IB file is the native
 `ib_state_{step}.dat`: 20 reals per body, in global ID order. Shards contain an
 integer count followed by integer global ID + 20 reals per local body. Identical
 replicated particle records are deduplicated; inconsistent duplicates fail.
-All IDs 1..N must be present. Particle timestamps must match snapshot `time`.
-`step` is the **saved file index**, which need not be the integration step when
-adaptive output is used. Supply physical times, not step numbers as time weights.
+All IDs 1..N must be present. Select snapshots using saved file indices only:
+
+```json
+"snapshots": [1000, 2000, 3000]
+```
+
+Each index replaces `{step}` in both the flow and particle filename patterns.
+It is the **saved file index**, which need not be the integration step when
+adaptive output is used. Indices must be unique nonnegative integers; processing
+follows the supplied order. Physical times are not user inputs and are not used
+for weighting or snapshot selection. The first particle record's timestamp is
+retained as descriptive output metadata only. Ensure that the flow and particle
+files come from the same saved output.
+
+Legacy objects such as `{"step": 1000}` or `{"step": 1000, "time": 0.001}`
+are also accepted. Any supplied `time` is ignored, including stale example times.
+Legacy `time_weighting` is ignored as well: all realizations have equal weight.
+These obsolete fields are removed before configuration hashing, so adding or
+removing them does not affect a new checkpoint's resumability. Checkpoints made
+before this step-only input change have a different configuration hash; reprocess
+into a new output path rather than combining old weighted diagnostics with new
+ones.
 
 The 20 fields are time, force(3), torque(3), velocity(3), angular_velocity(3),
 angles(3), centroid(3), radius. The geometry and kinematics are used directly.
@@ -285,16 +304,14 @@ instantaneous particle-average maps. They now expose the same moment fields,
 but their `.count` counts valid snapshots, not particle/timestep pairs. They
 must not be used as the pooled realization statistics.
 
-**`time_weighting` affects only `.time.*` diagnostics.** `"sample"` (the default
-and example) gives equal snapshot weights. `"trapezoid"` applies physical-time
-trapezoidal weights to those diagnostics. Neither changes `.pooled.*`: every
-particle/timestep pair has unit weight even when output times are irregular or
-particle counts change. This deliberately changes the old version-1 behavior,
-where trapezoidal weights also affected pooled statistics. Exclude startup
-transients in the configured snapshot list if a stationary ensemble is desired.
+Every `.time.*` diagnostic gives each valid instantaneous particle-average map
+unit weight. Every `.pooled.*` statistic gives each valid particle/timestep pair
+unit weight, even with irregular output times or changing particle counts.
+Physical-time trapezoidal weighting is no longer supported. Exclude startup
+transients by selecting the desired saved file indices.
 
 `metadata` contains the full configuration, filter widths, processed count,
-particle counts, input fingerprints, and explicit ensemble/normalization
+particle counts, file-derived `snapshot_times`, input fingerprints, and explicit ensemble/normalization
 conventions. Map coordinates remain in the configuration. Setting
 `save_snapshot_maps: true` additionally writes each snapshot's particle mean,
 variance, count, central moments 3-4, skewness, and Pearson kurtosis, together
@@ -335,7 +352,8 @@ surface-force/power integrals, map statistics, shared/sharded/Fortran-record inp
 and equality of uninterrupted versus checkpoint/resume processing. Higher-moment
 tests compare streamed and unevenly grouped data with direct sample statistics,
 including nonzero skewness, large mean offsets, missing/constant data, variable
-particle counts, irregular times, and legacy-checkpoint rejection. These tests
+particle counts, irregular file timestamps, step-only input, ignored legacy times,
+and legacy-checkpoint rejection. These tests
 establish numerical contracts; they do not replace a DNS comparison or a grid/
 filter/quadrature convergence study. For complete equation-balance tests, also
 include the simulation's external forcing and enough snapshots to estimate time
