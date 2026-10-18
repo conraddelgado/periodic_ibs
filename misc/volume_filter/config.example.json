@@ -37,6 +37,5 @@
     "length": 0.2,
     "points": 21
   },
-  "save_snapshot_maps": true,
   "output": "closure_statistics.npz"
 }

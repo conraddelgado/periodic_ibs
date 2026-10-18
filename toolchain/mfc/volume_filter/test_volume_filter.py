@@ -1,4 +1,4 @@
-"""Analytic identities, native binary layouts, particle maps, and restart tests."""
+"""Analytic identities, native binary layouts, particle maps, and final output tests."""
 
 import json
 import tempfile
@@ -51,7 +51,6 @@ def config():
         "snapshots": [1, 2],
         "output": "stats.npz",
         "fields": ["alpha", "R_u_xx", "F_x"],
-        "save_snapshot_maps": True,
     }
 
 
@@ -351,7 +350,7 @@ class ReaderAndPipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Overlapping"):
                 Reader(settings, grid, root)
 
-    def test_end_to_end_resume_equals_single_pass(self):
+    def test_end_to_end_final_output_and_failed_run(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "restart_data").mkdir()
@@ -364,25 +363,24 @@ class ReaderAndPipelineTests(unittest.TestCase):
                 particles(time=float(step)).tofile(root / f"restart_data/ib_state_{step}.dat")
             config_path = root / "config.json"
             config_path.write_text(json.dumps(cfg))
-            run(config_path, max_snapshots=1)
-            run(config_path, resume=True)
+            run(config_path)
             with np.load(root / "stats.npz") as data:
-                resumed = {key: data[key].copy() for key in data.files if key != "metadata"}
                 metadata = json.loads(str(data["metadata"]))
                 self.assertEqual(metadata["completed"], 2)
                 self.assertEqual(metadata["snapshot_times"], [1.0, 2.0])
-            cfg["output"] = "single.npz"
-            config_path.write_text(json.dumps(cfg))
-            run(config_path)
-            with np.load(root / "single.npz") as data:
-                for key, value in resumed.items():
-                    assert_allclose(data[key], value, equal_nan=True)
+                self.assertEqual(metadata["output_mode"], "final_only")
+                assert_allclose(data["sigma0.alpha.pooled.count"], 2)
+            self.assertEqual([p.name for p in root.glob("*.npz")], ["stats.npz"])
+            before = (root / "stats.npz").read_bytes()
             with self.assertRaises(FileExistsError):
                 run(config_path)
-            cfg["sigmas"] = [0.15]
+            self.assertEqual((root / "stats.npz").read_bytes(), before)
+            cfg.update(output="failed.npz", snapshots=[1, 3])
             config_path.write_text(json.dumps(cfg))
-            with self.assertRaisesRegex(ValueError, "mismatch"):
-                run(config_path, resume=True)
+            with self.assertRaises(FileNotFoundError):
+                run(config_path)
+            self.assertFalse((root / "failed.npz").exists())
+            self.assertFalse(list(root.glob("*.tmp")))
 
     def test_snapshot_steps_and_unsupported_physics(self):
         for snapshots in ([0, 1, 4], [{"step": 0}, {"step": 1}, {"step": 4}], [{"step": i, "time": "ignored"} for i in (0, 1, 4)]):

@@ -35,7 +35,7 @@ class ParticleProgress:
 
 
 def atomic_save(path, arrays):
-    """Replace a checkpoint only after a complete write and flush."""
+    """Publish final output only after a complete write and flush."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
@@ -85,6 +85,7 @@ def validate(config):
     # Normalize legacy objects before hashing; physical times are not inputs.
     config["snapshots"] = steps
     config.pop("time_weighting", None)
+    config.pop("save_snapshot_maps", None)
 
 
 def pack(moments, metadata):
@@ -104,28 +105,7 @@ def pack(moments, metadata):
         yield key + ".excess_kurtosis", value.kurtosis - 3
 
 
-def restore(path, digest):
-    moments = {}
-    with np.load(path, allow_pickle=False) as data:
-        metadata = json.loads(str(data["metadata"]))
-        if metadata["version"] != VERSION:
-            raise ValueError("Checkpoint version mismatch: moments 3-4 and realization counts require reprocessing the snapshots into a new output path")
-        if metadata["config_hash"] != digest:
-            raise ValueError("Checkpoint configuration mismatch; use a new output path")
-        for key in data.files:
-            if key.endswith(".weight"):
-                name = key[:-7]
-                result = Moments(data[key].shape)
-                result.weight = data[key].copy()
-                result.count = data[name + ".count"].copy()
-                result.mean = np.where(result.weight > 0, data[name + ".mean"], 0)
-                for order in (2, 3, 4):
-                    setattr(result, f"m{order}", data[name + f".m{order}"].copy())
-                moments[name] = result
-    return moments, metadata
-
-
-def run(config_path, resume=False, max_snapshots=None, progress_interval=5.0):
+def run(config_path, progress_interval=5.0):
     if not np.isfinite(progress_interval) or progress_interval < 0:
         raise ValueError("progress_interval must be finite and nonnegative")
     config_path = Path(config_path).resolve()
@@ -135,9 +115,12 @@ def run(config_path, resume=False, max_snapshots=None, progress_interval=5.0):
     reader = Reader(config["io"], grid, config_path.parent)
     mapper = ParticleMap(grid, config["map"])
     output = config_path.parent / config["output"]
+    if output.exists():
+        raise FileExistsError(f"{output} exists; select a new output path or remove the old file")
     digest = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
     metadata = {
         "version": VERSION,
+        "output_mode": "final_only",
         "config_hash": digest,
         "config": config,
         "statistics": {
@@ -154,20 +137,8 @@ def run(config_path, resume=False, max_snapshots=None, progress_interval=5.0):
         "snapshot_times": [],
     }
     moments = {}
-    if output.exists():
-        if not resume:
-            raise FileExistsError(f"{output} exists; use --resume or select a new output")
-        moments, metadata = restore(output, digest)
-        for step, previous in zip(config["snapshots"], metadata["inputs"]):
-            if json.loads(json.dumps(reader.fingerprint(step))) != previous:
-                raise ValueError("A previously processed input file changed")
-    elif resume:
-        raise FileNotFoundError(f"Cannot resume missing checkpoint {output}")
     selected = set(config.get("fields", []))
-    start = metadata["completed"]
-    end = len(config["snapshots"]) if max_snapshots is None else min(len(config["snapshots"]), start + max_snapshots)
-    for index in range(start, end):
-        step = config["snapshots"][index]
+    for index, step in enumerate(config["snapshots"]):
         label = f"Snapshot {index + 1}/{len(config['snapshots'])} step={step}"
         print(f"{label}: reading particle state", flush=True)
         fingerprint = reader.fingerprint(step)
@@ -175,7 +146,6 @@ def run(config_path, resume=False, max_snapshots=None, progress_interval=5.0):
         time = float(particles[0, 0])  # File timestamp is descriptive metadata only.
         print(f"{label}: time={time}, particles={len(particles)}; reading/reconstructing fluid state", flush=True)
         state = reconstruct(grid, reader.fields(step), particles, config["physics"])
-        snapshot_maps = {}
         for sigma_index, sigma in enumerate(config["sigmas"]):
             filter_label = f"{label} filter={sigma_index + 1}/{len(config['sigmas'])} sigma={sigma}"
             print(f"{filter_label}: computing full-domain closure fields and mapping particles", flush=True)
@@ -194,14 +164,6 @@ def run(config_path, resume=False, max_snapshots=None, progress_interval=5.0):
                         moments[key + suffix] = Moments(mapper.shape)
                 moments[key + ".time"].update(valid_mean)
                 moments[key + ".pooled"].merge(particle)
-                if config.get("save_snapshot_maps", False):
-                    snapshot_maps[key + ".mean"] = valid_mean
-                    snapshot_maps[key + ".particle_variance"] = particle.variance
-                    snapshot_maps[key + ".particle_count"] = particle.count
-                    snapshot_maps[key + ".particle_central_moment3"] = particle.central_moment(3)
-                    snapshot_maps[key + ".particle_central_moment4"] = particle.central_moment(4)
-                    snapshot_maps[key + ".particle_skewness"] = particle.skewness
-                    snapshot_maps[key + ".particle_kurtosis"] = particle.kurtosis
             if selected - seen:
                 raise ValueError(f"Unknown fields: {sorted(selected - seen)}")
         del state
@@ -211,27 +173,21 @@ def run(config_path, resume=False, max_snapshots=None, progress_interval=5.0):
         metadata["inputs"].append(fingerprint)
         metadata["particle_counts"].append(len(particles))
         metadata["snapshot_times"].append(time)
-        print(f"{label}: writing statistics/checkpoint", flush=True)
-        if snapshot_maps:
-            snapshot_maps["metadata"] = np.array(json.dumps({"config_hash": digest, "step": step, "time": time}))
-            atomic_save(output.with_name(f"{output.stem}.step{step}.npz"), snapshot_maps)
-        atomic_save(output, pack(moments, metadata))
-        print(f"Checkpoint saved: {output}", flush=True)
+        print(f"{label}: complete; statistics retained in memory", flush=True)
+    print(f"Writing final statistics: {output}", flush=True)
+    atomic_save(output, pack(moments, metadata))
+    print(f"Final output saved: {output}", flush=True)
     return output
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path)
-    parser.add_argument("--resume", action="store_true", help="Resume an identical configuration without counting snapshots twice")
-    parser.add_argument("--max-snapshots", type=int, help="Process at most this many additional snapshots")
     parser.add_argument("--progress-interval", type=float, default=5.0, help="Seconds between particle progress lines (default: 5; 0 prints every particle)")
     args = parser.parse_args()
-    if args.max_snapshots is not None and args.max_snapshots < 1:
-        parser.error("--max-snapshots must be positive")
     if not np.isfinite(args.progress_interval) or args.progress_interval < 0:
         parser.error("--progress-interval must be finite and nonnegative")
-    run(args.config, args.resume, args.max_snapshots, args.progress_interval)
+    run(args.config, progress_interval=args.progress_interval)
 
 
 if __name__ == "__main__":

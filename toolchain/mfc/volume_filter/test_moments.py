@@ -1,4 +1,4 @@
-"""Pooled higher moments against direct sample statistics, including resume."""
+"""Pooled higher moments against direct sample statistics, including final output."""
 
 import json
 import tempfile
@@ -11,7 +11,7 @@ from unittest.mock import patch
 import numpy as np
 from numpy.testing import assert_allclose, assert_array_equal
 
-from .__main__ import VERSION, atomic_save, pack, restore, run
+from .__main__ import VERSION, atomic_save, pack, run
 from .maps import Moments
 from .test_volume_filter import config, particles
 
@@ -110,20 +110,29 @@ class MomentTests(unittest.TestCase):
         merged.merge(accumulate(samples[3:]))
         self.assert_direct(merged, samples, rtol=2e-6)
 
-    def test_checkpoint_roundtrip_and_legacy_rejection(self):
+    def test_final_output_roundtrip_and_atomic_failure(self):
         samples = np.array([[1.0, np.nan], [4.0, 3.0], [9.0, 3.0], [-2.0, 3.0]])
+        result = accumulate(samples)
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "checkpoint.npz"
-            first = accumulate(samples[:2])
-            metadata = {"version": VERSION, "config_hash": "test"}
-            atomic_save(path, pack({"sigma0.F_x.pooled": first}, metadata))
-            loaded, _ = restore(path, "test")
-            loaded["sigma0.F_x.pooled"].merge(accumulate(samples[2:]))
-            self.assert_direct(loaded["sigma0.F_x.pooled"], samples)
-            metadata["version"] = 1
-            atomic_save(path, pack({"sigma0.F_x.pooled": first}, metadata))
-            with self.assertRaisesRegex(ValueError, "reprocessing"):
-                restore(path, "test")
+            path = Path(directory) / "statistics.npz"
+            metadata = {"version": VERSION, "output_mode": "final_only"}
+            atomic_save(path, pack({"sigma0.F_x.pooled": result}, metadata))
+            with np.load(path) as data:
+                self.assertEqual(json.loads(str(data["metadata"])), metadata)
+                for name in ("mean", "variance", "skewness", "kurtosis", "count"):
+                    assert_allclose(data["sigma0.F_x.pooled." + name], getattr(result, name))
+                for order in (2, 3, 4):
+                    assert_allclose(data[f"sigma0.F_x.pooled.central_moment{order}"], result.central_moment(order))
+
+            def broken_output():
+                yield "first", np.ones(2)
+                raise RuntimeError("interrupted output")
+
+            failed = Path(directory) / "failed.npz"
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                atomic_save(failed, broken_output())
+            self.assertFalse(failed.exists())
+            self.assertFalse(list(Path(directory).glob("*.tmp")))
 
     def test_pipeline_pools_particles_not_snapshot_means(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -150,7 +159,7 @@ class MomentTests(unittest.TestCase):
             for mode in ("steps", "legacy"):
                 cfg["output"] = f"{mode}.npz"
                 if mode == "legacy":
-                    cfg.update(snapshots=[{"step": i, "time": 0.001} for i in range(3)], time_weighting="trapezoid")
+                    cfg.update(snapshots=[{"step": i, "time": 0.001} for i in range(3)], time_weighting="trapezoid", save_snapshot_maps=True)
                 path = root / "config.json"
                 path.write_text(json.dumps(cfg))
                 progress_log = StringIO()
@@ -158,12 +167,11 @@ class MomentTests(unittest.TestCase):
                     redirect_stdout(progress_log),
                     patch("mfc.volume_filter.__main__.reconstruct", return_value=None),
                     patch("mfc.volume_filter.__main__.closure_fields", side_effect=synthetic_fields),
+                    patch("mfc.volume_filter.__main__.atomic_save", wraps=atomic_save) as save,
                 ):
-                    run(path, max_snapshots=1, progress_interval=0)
-                    # Resume also accepts equivalent legacy syntax with stale times.
-                    cfg["snapshots"] = [{"step": i, "time": -999} for i in range(3)]
-                    path.write_text(json.dumps(cfg))
-                    run(path, resume=True, progress_interval=0)
+                    run(path, progress_interval=0)
+                    self.assertEqual(save.call_count, 1)
+                self.assertFalse(list(root.glob("*.step*.npz")))
                 log = progress_log.getvalue()
                 for i, centers in enumerate(positions):
                     label = f"Snapshot {i + 1}/3 step={i}"
@@ -171,14 +179,14 @@ class MomentTests(unittest.TestCase):
                     prefix = f"{label} filter=1/1 sigma=0.1 F_x: particles"
                     for completed in range(len(centers) + 1):
                         self.assertEqual(log.count(f"{prefix} {completed}/{len(centers)} ("), 1)
-                    self.assertIn(f"{label}: writing statistics/checkpoint", log)
+                    self.assertIn(f"{label}: complete; statistics retained in memory", log)
                 with np.load(root / cfg["output"]) as data:
                     metadata = json.loads(str(data["metadata"]))
                     self.assertEqual(metadata["snapshot_times"], times)
                     self.assertEqual(metadata["config"]["snapshots"], [0, 1, 2])
                     assert_allclose(data["sigma0.F_x.time.weight"], 3)
-                    with np.load(root / f"{mode}.step2.npz") as snapshot:
-                        self.assertEqual(json.loads(str(snapshot["metadata"]))["time"], 4.0)
+                    self.assertEqual(metadata["output_mode"], "final_only")
+                    self.assertEqual(metadata["completed"], 3)
                     prefix = "sigma0.F_x.pooled"
                     assert_array_equal(data[prefix + ".count"], np.full((3, 3, 3), 6))
                     samples = np.broadcast_to(np.array(expected)[:, None, None, None] + np.linspace(-0.0625, 0.0625, 3)[None, :, None, None], (6, 3, 3, 3))
