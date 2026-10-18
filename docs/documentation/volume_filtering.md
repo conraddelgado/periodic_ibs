@@ -66,7 +66,7 @@ PYTHONPATH=toolchain python -m mfc.volume_filter /path/to/case/closures.json --p
 Use `--progress-interval 0` to print every particle. Counts reset for each field
 and filter because the code maps one full-domain closure component at a time.
 They count processed particles, including any with invalid map locations; valid
-statistical support is still recorded separately in the output count arrays.
+statistical support is tracked internally when samples are accumulated.
 The percentage and elapsed time describe the current field's mapping pass, not
 the entire snapshot. Full-domain FFT/closure calculations occur between mapping
 passes and do not have a particle counter. Progress reporting does not change
@@ -178,8 +178,8 @@ For each configured saved index, the processor:
    at the particle-centered map, averages theta first for axisymmetric maps, then
    updates pointwise count, mean, and central sums through order four. There is
    no Python loop over the individual interpolation points.
-5. Merges that particle distribution into the pooled accumulator and separately
-   accumulates the particle-average map into the snapshot diagnostic.
+5. Merges that particle distribution into the cumulative ensemble over all
+   particle/timestep pairs, preserving within-snapshot scatter.
 6. Continues to the next saved index without writing map data. After every
    snapshot/filter/component finishes, writes one final statistics file.
 
@@ -216,14 +216,15 @@ FFTs, final output, and production DNS validation.
 A 100^3 map contains one million locations, 1000 times a 10^3 map. Mapping cost
 still scales with map locations x particles x selected components x filter
 widths x snapshots. All 59 scalar outputs are selected if `fields` is omitted.
-At 100^3 locations, the two cumulative statistics streams require about 96 MB
-per scalar component/filter, or 5.7 GB for all 59 outputs at one filter width,
-excluding DNS/work arrays and temporaries. The uncompressed final output contains
-about 272 MB per component/filter (17 arrays per stream), or 16 GB for all 59.
-It is written only once at the end. No per-snapshot maps are retained or written.
-These figures use decimal GB and scale linearly with filter count. Restrict
-`fields` to needed components to reduce mapping work, statistics memory, and
-final output size.
+At 100^3 locations, the cumulative accumulator uses about 48 MB per scalar
+component/filter, or 2.8 GB for all 59 outputs at one filter width, excluding
+DNS/work arrays and temporaries. The final NPZ stores four arrays per
+component/filter: 32 MB each, or 1.9 GB for all 59. This is about 88 percent less
+array storage than the earlier 34-array output, while removing the separate
+snapshot-average accumulators halves persistent statistics memory. Output is
+written only once at the end. These figures use decimal GB and scale linearly
+with filter count. Restrict `fields` to needed components to reduce mapping work,
+statistics memory, and final output size.
 
 ## Closure conventions
 
@@ -264,7 +265,8 @@ No full-domain closure volumes are written.
 Intrinsic quantities are undefined where alpha < `alpha_min` or filtered mass is
 nonpositive: these values are NaN, not clipped into apparently valid results.
 Their weighted companions are also invalidated because their nonlinear terms
-use the same mass denominator. Sample weights reveal missing map support.
+use the same mass denominator. Invalid samples are excluded internally from the
+ensemble; unsupported locations produce NaN statistics.
 
 ## Interface and derivative discretization
 
@@ -392,68 +394,60 @@ with N valid pairs, the population estimators are
 c_r = \frac{1}{N}\sum_{t,p}(X_{p,t}-\mu)^r, \quad r=2,3,4.
 \f]
 
-Skewness is c3/c2^(3/2). Pearson kurtosis (flatness) is c4/c2^2; a Gaussian
-population has kurtosis 3. Excess kurtosis is kurtosis minus 3. Variance is c2,
-using N rather than N-1. These are empirical population moments, not bias-corrected
-estimates. Raw moments E[X^r] for orders 1-4 are also exported to make the
-meaning of "moment" unambiguous. The first central moment is identically zero;
-`mean` (first raw moment) is the useful first-order statistic.
+The saved statistics are mean, population variance c2, skewness c3/c2^(3/2),
+and Pearson kurtosis c4/c2^2. A Gaussian population has kurtosis 3. Variance uses
+N rather than N-1; the statistics are empirical population estimators without
+finite-sample bias corrections.
 
 Particle realizations are accumulated before particle averaging. Snapshot batches
-are merged using their counts, means, and **all three central sums** M2, M3, M4;
+are merged using internal counts, means, and all three central sums M2, M3, M4;
 merging only particle-average maps would lose within-snapshot scatter. These
 pairwise formulas follow
-[Pebay, SAND2008-6212](https://doi.org/10.2172/1028931). They accumulate central
-sums directly rather than obtaining them by cancellation of large raw powers.
-The raw moments are derived only for output. All accumulators use float64, with
-int64 valid-realization counts, and memory remains independent of the number of
-snapshots. Two extra central-sum arrays and a count array are retained per
-accumulator; final output entries are streamed instead of duplicating every derived
-output in memory.
+[Pebay, SAND2008-6212](https://doi.org/10.2172/1028931). Accumulators use float64,
+with int64 valid-realization counts, and memory remains independent of the number
+of snapshots. Counts, weights, and central sums are needed internally for stable
+accumulation, but are not written to disk. Final output entries are streamed
+instead of duplicating all derived arrays in memory.
 
-For each filter/component, the final NPZ contains:
+The version-3 NPZ uses **field, statistic, filter index** ordering:
 
-| Suffix under `sigma0.R_u_xx.pooled` | Meaning |
+| Example key | Meaning |
 |---|---|
-| `.count` | Number of finite particle/timestep realizations at each map location |
-| `.weight` | Same as count for this equally weighted ensemble (legacy key retained) |
-| `.mean` | First raw moment |
-| `.variance`, `.central_moment2` | Second central moment |
-| `.central_moment3`, `.central_moment4` | Unstandardized third and fourth central moments |
-| `.skewness`, `.kurtosis`, `.excess_kurtosis` | Standardized shape statistics |
-| `.raw_moment1` through `.raw_moment4` | Raw moments E[X^r] |
-| `.m2`, `.m3`, `.m4` | Unnormalized central sums |
+| `F_x.mean.sigma0` | Ensemble mean of F_x at the first configured filter width |
+| `F_x.variance.sigma0` | Population variance of F_x |
+| `F_x.skewness.sigma0` | Standardized third central moment of F_x |
+| `F_x.kurtosis.sigma0` | Pearson kurtosis of F_x |
+| `R_u_xy.mean.sigma1` | Mean xy momentum-flux closure at the second filter width |
 
-An empty location has NaN mean/moments and zero count. A constant realization
-sequence has zero central moments and **NaN skewness/kurtosis**, because its
-variance is zero. Invalid samples are excluded separately at each location;
-inspect count maps rather than assuming every location has N_particles*N_times.
-For axisymmetric maps, one realization is a particle's **ring average** at one
-timestep: the azimuthal points are not counted as separate realizations. These
-statistics therefore exclude variability removed by the angular average.
+`metadata` is the only entry other than these four statistics per selected
+field/filter. No `.time`, `.pooled`, raw moments, central moments, counts,
+weights, central sums, or excess-kurtosis arrays are saved. All statistics use
+the equally weighted particle/timestep ensemble. With all 59 fields and one
+filter width, the NPZ has 237 keys including metadata, versus 2007 previously.
 
-The existing `sigma0.R_u_xx.time.*` outputs remain separate diagnostics over
-instantaneous particle-average maps. They now expose the same moment fields,
-but their `.count` counts valid snapshots, not particle/timestep pairs. They
-must not be used as the pooled realization statistics.
+An unsupported location has NaN statistics. A constant realization sequence has
+zero variance and NaN skewness/kurtosis. Invalid samples are excluded separately
+at each map location, so the internal realization count may vary spatially.
+For axisymmetric maps, one realization is a particle's ring average at one
+timestep; azimuthal points are not additional realizations. Statistics therefore
+exclude variability removed by the angular average.
 
-Every `.time.*` diagnostic gives each valid instantaneous particle-average map
-unit weight. Every `.pooled.*` statistic gives each valid particle/timestep pair
-unit weight, even with irregular output times or changing particle counts.
-Physical-time trapezoidal weighting is no longer supported. Exclude startup
-transients by selecting the desired saved file indices.
-
+Every valid particle/timestep pair has unit weight even with irregular output
+times or changing particle counts. Exclude startup transients by selecting the
+desired saved file indices. Separate statistics over instantaneous
+particle-average maps are no longer computed.
 `metadata` contains the full configuration, filter widths, processed count,
 particle counts, file-derived `snapshot_times`, input fingerprints, and explicit ensemble/normalization
 conventions. Box coordinates can be reconstructed from `config["map"]["length"]`
 and `config["map"]["points"]` using the linspace above. Axisymmetric coordinates
 can likewise be reconstructed from the stored extent/count parameters. Metadata
-also records `output_mode: "final_only"` and the total completed snapshot count.
+also records `output_mode: "final_only"`, output format version 3, the key naming
+convention, retained statistic names, and the total completed snapshot count.
 
 The ensemble calculation treats particle/timestep pairs as distinct realizations.
 It does not demonstrate physical independence: nearby particles and closely
 spaced times may be correlated. No effective sample size, confidence intervals,
-or autocorrelation estimates are inferred from the stored counts.
+or autocorrelation estimates are inferred.
 
 ```python
 import json
@@ -461,15 +455,23 @@ import numpy as np
 
 with np.load("closure_statistics.npz", allow_pickle=False) as data:
     metadata = json.loads(str(data["metadata"]))
-    prefix = "sigma0.R_u_xx.pooled"
-    count = data[prefix + ".count"]
-    mean = data[prefix + ".mean"]
-    variance = data[prefix + ".variance"]
-    skewness = data[prefix + ".skewness"]
-    kurtosis = data[prefix + ".kurtosis"]
-    third_central_moment = data[prefix + ".central_moment3"]
-    fourth_raw_moment = data[prefix + ".raw_moment4"]
+    mean = data["F_x.mean.sigma0"]
+    variance = data["F_x.variance.sigma0"]
+    skewness = data["F_x.skewness.sigma0"]
+    kurtosis = data["F_x.kurtosis.sigma0"]
 ```
+
+Completed version-2 output files can be reduced without rerunning the simulation
+or closure calculations:
+
+```bash
+PYTHONPATH=toolchain python -m mfc.volume_filter.compact old_statistics.npz compact_statistics.npz
+```
+
+The converter copies only the four pooled statistics, renames their keys, and
+updates metadata. It streams one array at a time, leaves the original intact,
+refuses an existing destination, and rejects incomplete runs or incompatible
+weighting. Existing plotting scripts must switch to the new key names.
 
 ## Validation
 
@@ -487,7 +489,8 @@ and a single final write after all snapshots complete. Higher-moment
 tests compare streamed and unevenly grouped data with direct sample statistics,
 including nonzero skewness, large mean offsets, missing/constant data, variable
 particle counts, irregular file timestamps, step-only input, ignored legacy times,
-final statistics serialization, and failure cleanup. These tests
+final statistics serialization, compact-output key sets, legacy-file conversion,
+and failure cleanup. These tests
 establish numerical contracts; they do not replace a DNS comparison or a grid/
 filter/quadrature convergence study. For complete equation-balance tests, also
 include the simulation's external forcing and enough snapshots to estimate time

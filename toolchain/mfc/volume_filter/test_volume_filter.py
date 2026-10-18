@@ -369,7 +369,9 @@ class ReaderAndPipelineTests(unittest.TestCase):
                 self.assertEqual(metadata["completed"], 2)
                 self.assertEqual(metadata["snapshot_times"], [1.0, 2.0])
                 self.assertEqual(metadata["output_mode"], "final_only")
-                assert_allclose(data["sigma0.alpha.pooled.count"], 2)
+                self.assertTrue(np.all(np.isfinite(data["alpha.mean.sigma0"])))
+                assert_allclose(data["alpha.variance.sigma0"], 0)
+                self.assertEqual(len(data.files), 1 + 4 * len(cfg["fields"]))
             self.assertEqual([p.name for p in root.glob("*.npz")], ["stats.npz"])
             before = (root / "stats.npz").read_bytes()
             with self.assertRaises(FileExistsError):

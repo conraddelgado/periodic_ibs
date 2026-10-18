@@ -11,11 +11,13 @@ from time import perf_counter
 import numpy as np
 
 from .closures import closure_fields, reconstruct
-from .maps import Moments, ParticleMap
+from .maps import ParticleMap
 from .numerics import Grid
 from .reader import Reader
 
-VERSION = 2
+VERSION = 3
+STATISTICS = ("mean", "variance", "skewness", "kurtosis")
+KEY_FORMAT = "{field}.{statistic}.sigma{filter_index}"
 
 
 class ParticleProgress:
@@ -90,19 +92,10 @@ def validate(config):
 
 def pack(moments, metadata):
     yield "metadata", np.array(json.dumps(metadata, sort_keys=True))
-    for key, value in moments.items():
-        yield key + ".count", value.count
-        yield key + ".weight", value.weight
-        yield key + ".mean", np.where(value.weight > 0, value.mean, np.nan)
-        for order in (2, 3, 4):
-            yield key + f".m{order}", getattr(value, f"m{order}")
-            yield key + f".central_moment{order}", value.central_moment(order)
-        for order in (1, 2, 3, 4):
-            yield key + f".raw_moment{order}", value.raw_moment(order)
-        yield key + ".variance", value.variance
-        yield key + ".skewness", value.skewness
-        yield key + ".kurtosis", value.kurtosis
-        yield key + ".excess_kurtosis", value.kurtosis - 3
+    for (name, sigma_index), value in moments.items():
+        for statistic in STATISTICS:
+            array = np.where(value.weight > 0, value.mean, np.nan) if statistic == "mean" else getattr(value, statistic)
+            yield KEY_FORMAT.format(field=name, statistic=statistic, filter_index=sigma_index), array
 
 
 def run(config_path, progress_interval=5.0):
@@ -121,12 +114,13 @@ def run(config_path, progress_interval=5.0):
     metadata = {
         "version": VERSION,
         "output_mode": "final_only",
+        "key_format": KEY_FORMAT,
         "config_hash": digest,
         "config": config,
         "statistics": {
             "ensemble": "particle_timestep_pairs",
             "pooled_weighting": "equal_realizations",
-            "snapshot_weighting": "equal_snapshots",
+            "outputs": list(STATISTICS),
             "max_order": 4,
             "normalization": "population",
             "kurtosis": "Pearson",
@@ -155,15 +149,11 @@ def run(config_path, progress_interval=5.0):
                 if selected and name not in selected:
                     continue
                 particle = mapper.particles(field, particles, progress=ParticleProgress(f"{filter_label} {name}", progress_interval))
-                key = f"sigma{sigma_index}.{name}"
-                valid_mean = np.where(particle.weight > 0, particle.mean, np.nan)
-                # Keep time-series diagnostics distinct from the equally weighted
-                # particle/timestep ensemble, even for irregular snapshot times.
-                for suffix in (".time", ".pooled"):
-                    if key + suffix not in moments:
-                        moments[key + suffix] = Moments(mapper.shape)
-                moments[key + ".time"].update(valid_mean)
-                moments[key + ".pooled"].merge(particle)
+                key = (name, sigma_index)
+                if key not in moments:
+                    moments[key] = particle
+                else:
+                    moments[key].merge(particle)
             if selected - seen:
                 raise ValueError(f"Unknown fields: {sorted(selected - seen)}")
         del state
