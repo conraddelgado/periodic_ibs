@@ -6,6 +6,7 @@ import json
 import os
 import zipfile
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 
@@ -15,6 +16,22 @@ from .numerics import Grid
 from .reader import Reader
 
 VERSION = 2
+
+
+class ParticleProgress:
+    """Flush periodic particle counts to terminals and batch-job logs."""
+
+    def __init__(self, label, interval):
+        self.label, self.interval = label, interval
+        self.start = self.last = perf_counter()
+
+    def __call__(self, completed, total):
+        now = perf_counter()
+        if completed not in (0, total) and now - self.last < self.interval:
+            return
+        percent = 100 * completed / total if total else 100.0
+        print(f"{self.label}: particles {completed}/{total} ({percent:.1f}%), elapsed {now - self.start:.1f}s", flush=True)
+        self.last = now
 
 
 def atomic_save(path, arrays):
@@ -108,7 +125,9 @@ def restore(path, digest):
     return moments, metadata
 
 
-def run(config_path, resume=False, max_snapshots=None):
+def run(config_path, resume=False, max_snapshots=None, progress_interval=5.0):
+    if not np.isfinite(progress_interval) or progress_interval < 0:
+        raise ValueError("progress_interval must be finite and nonnegative")
     config_path = Path(config_path).resolve()
     config = json.loads(config_path.read_text())
     validate(config)
@@ -149,19 +168,23 @@ def run(config_path, resume=False, max_snapshots=None):
     end = len(config["snapshots"]) if max_snapshots is None else min(len(config["snapshots"]), start + max_snapshots)
     for index in range(start, end):
         step = config["snapshots"][index]
+        label = f"Snapshot {index + 1}/{len(config['snapshots'])} step={step}"
+        print(f"{label}: reading particle state", flush=True)
         fingerprint = reader.fingerprint(step)
         particles = reader.particles(step)
         time = float(particles[0, 0])  # File timestamp is descriptive metadata only.
+        print(f"{label}: time={time}, particles={len(particles)}; reading/reconstructing fluid state", flush=True)
         state = reconstruct(grid, reader.fields(step), particles, config["physics"])
-        print(f"Snapshot {index + 1}/{len(config['snapshots'])}: step={step}, time={time}, particles={len(particles)}", flush=True)
         snapshot_maps = {}
         for sigma_index, sigma in enumerate(config["sigmas"]):
+            filter_label = f"{label} filter={sigma_index + 1}/{len(config['sigmas'])} sigma={sigma}"
+            print(f"{filter_label}: computing full-domain closure fields and mapping particles", flush=True)
             seen = set()
             for name, field in closure_fields(grid, state, particles, sigma, config):
                 seen.add(name)
                 if selected and name not in selected:
                     continue
-                particle = mapper.particles(field, particles)
+                particle = mapper.particles(field, particles, progress=ParticleProgress(f"{filter_label} {name}", progress_interval))
                 key = f"sigma{sigma_index}.{name}"
                 valid_mean = np.where(particle.weight > 0, particle.mean, np.nan)
                 # Keep time-series diagnostics distinct from the equally weighted
@@ -188,6 +211,7 @@ def run(config_path, resume=False, max_snapshots=None):
         metadata["inputs"].append(fingerprint)
         metadata["particle_counts"].append(len(particles))
         metadata["snapshot_times"].append(time)
+        print(f"{label}: writing statistics/checkpoint", flush=True)
         if snapshot_maps:
             snapshot_maps["metadata"] = np.array(json.dumps({"config_hash": digest, "step": step, "time": time}))
             atomic_save(output.with_name(f"{output.stem}.step{step}.npz"), snapshot_maps)
@@ -201,10 +225,13 @@ def main():
     parser.add_argument("config", type=Path)
     parser.add_argument("--resume", action="store_true", help="Resume an identical configuration without counting snapshots twice")
     parser.add_argument("--max-snapshots", type=int, help="Process at most this many additional snapshots")
+    parser.add_argument("--progress-interval", type=float, default=5.0, help="Seconds between particle progress lines (default: 5; 0 prints every particle)")
     args = parser.parse_args()
     if args.max_snapshots is not None and args.max_snapshots < 1:
         parser.error("--max-snapshots must be positive")
-    run(args.config, args.resume, args.max_snapshots)
+    if not np.isfinite(args.progress_interval) or args.progress_interval < 0:
+        parser.error("--progress-interval must be finite and nonnegative")
+    run(args.config, args.resume, args.max_snapshots, args.progress_interval)
 
 
 if __name__ == "__main__":

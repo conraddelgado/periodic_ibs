@@ -143,9 +143,12 @@ class ParticleMap:
         if np.any(np.max(np.abs(self.offsets), axis=0) >= np.asarray(grid.lengths) / 2):
             raise ValueError("Map offsets must stay within half the box length to avoid repeated periodic images")
 
-    def particles(self, field, states):
+    def particles(self, field, states, progress=None):
         result = Moments(self.shape)
-        for particle in states:
+        total = len(states)
+        if progress is not None:
+            progress(0, total)
+        for completed, particle in enumerate(states, 1):
             value = self.grid.sample(field, particle[16:19] + self.offsets)
             if self.mode == "axisymmetric":
                 # Reject an incomplete ring; do not bias an angular average by masking angles.
@@ -153,4 +156,6 @@ class ParticleMap:
             else:
                 value = value.reshape(self.shape)
             result.update(value)
+            if progress is not None:
+                progress(completed, total)
         return result

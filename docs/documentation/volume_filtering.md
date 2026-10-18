@@ -52,6 +52,33 @@ PYTHONPATH=toolchain python -m mfc.volume_filter /path/to/case/closures.json --m
 PYTHONPATH=toolchain python -m mfc.volume_filter /path/to/case/closures.json --resume
 ```
 
+Progress is printed and flushed to the terminal or batch-job log automatically.
+The processor reports particle reading, fluid-state reconstruction, each filter's
+closure computation, and checkpoint writing. During map accumulation, each
+snapshot/filter/component reports its own processed-particle counter, for example:
+
+```text
+Snapshot 1/3 step=1000 filter=1/2 sigma=0.025 F_x: particles 143/1000 (14.3%), elapsed 5.0s
+```
+
+Each counter starts at zero and ends at the total particle count. Intermediate
+updates are limited to one every five seconds, checked after each particle
+finishes. Override the interval without changing the configuration/checkpoint:
+
+```bash
+PYTHONPATH=toolchain python -m mfc.volume_filter /path/to/case/closures.json --progress-interval 1
+```
+
+Use `--progress-interval 0` to print every particle. Counts reset for each field
+and filter because the code maps one full-domain closure component at a time.
+They count processed particles, including any with invalid map locations; valid
+statistical support is still recorded separately in the output count arrays.
+The percentage and elapsed time describe the current field's mapping pass, not
+the entire snapshot. Full-domain FFT/closure calculations occur between mapping
+passes and do not have a particle counter. On resume, completed snapshots are
+skipped as before. Progress reporting does not change numerical results or the
+checkpoint format.
+
 Only consume completely written, immutable snapshots. Checkpoints are replaced
 atomically after all filter widths and selected maps for a snapshot succeed.
 Resume checks the complete configuration, format version, and processed input

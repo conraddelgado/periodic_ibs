@@ -3,6 +3,8 @@
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -143,12 +145,25 @@ class MomentTests(unittest.TestCase):
                     cfg.update(snapshots=[{"step": i, "time": 0.001} for i in range(3)], time_weighting="trapezoid")
                 path = root / "config.json"
                 path.write_text(json.dumps(cfg))
-                with patch("mfc.volume_filter.__main__.reconstruct", return_value=None), patch("mfc.volume_filter.__main__.closure_fields", side_effect=synthetic_fields):
-                    run(path, max_snapshots=1)
+                progress_log = StringIO()
+                with (
+                    redirect_stdout(progress_log),
+                    patch("mfc.volume_filter.__main__.reconstruct", return_value=None),
+                    patch("mfc.volume_filter.__main__.closure_fields", side_effect=synthetic_fields),
+                ):
+                    run(path, max_snapshots=1, progress_interval=0)
                     # Resume also accepts equivalent legacy syntax with stale times.
                     cfg["snapshots"] = [{"step": i, "time": -999} for i in range(3)]
                     path.write_text(json.dumps(cfg))
-                    run(path, resume=True)
+                    run(path, resume=True, progress_interval=0)
+                log = progress_log.getvalue()
+                for i, centers in enumerate(positions):
+                    label = f"Snapshot {i + 1}/3 step={i}"
+                    self.assertEqual(log.count(f"{label}: reading particle state"), 1)
+                    prefix = f"{label} filter=1/1 sigma=0.1 F_x: particles"
+                    for completed in range(len(centers) + 1):
+                        self.assertEqual(log.count(f"{prefix} {completed}/{len(centers)} ("), 1)
+                    self.assertIn(f"{label}: writing statistics/checkpoint", log)
                 with np.load(root / cfg["output"]) as data:
                     metadata = json.loads(str(data["metadata"]))
                     self.assertEqual(metadata["snapshot_times"], times)
