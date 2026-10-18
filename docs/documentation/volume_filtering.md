@@ -166,6 +166,74 @@ surface traction. MFC's force history has stage-timing considerations; its
 `patch_ib%%force` can also include collisions/body forces. Such values are not
 unconditionally valid hydrodynamic force checks.
 
+## Execution order and map performance
+
+For each configured saved index, the processor:
+
+1. Reads particle state, builds the periodic fluid/solid mask, and reads the five
+   conservative fluid components. Reconstructs velocity, pressure, and temperature.
+2. For each filter width, constructs the Gaussian Fourier multiplier and filters
+   the fluid indicator, density, momentum, and pressure. Produces alpha, intrinsic
+   density, Favre velocity components, and Favre temperature.
+3. Builds surface quadrature and reconstructed traces, then yields closure
+   components sequentially: R_u and R_mu tensor components; R_uu, R_Tu, R_tau_u,
+   and R_q vector components; finally F_x/F_y/F_z, Q, and F_u. Intrinsic R terms
+   also yield their alpha-weighted companions. Dependencies and work arrays are
+   retained as needed, but all resulting full-domain components are not stored
+   simultaneously.
+4. For each selected yielded component, loops over particles. Samples the closure
+   at the particle-centered map, averages theta first for axisymmetric maps, then
+   updates pointwise count, mean, and central sums through order four. There is
+   no Python loop over the individual interpolation points.
+5. Merges that particle distribution into the pooled accumulator and separately
+   accumulates the particle-average map into the snapshot diagnostic. Optional
+   per-snapshot statistics are retained until the snapshot finishes.
+6. After all filters/components finish, writes optional snapshot maps and rewrites
+   the cumulative checkpoint. Continues with the next saved index.
+
+`fields` currently selects **mapping and storage**, not a dependency-pruned
+closure calculation: unselected fields are still computed/yielded and skipped by
+the caller. Thus selecting only `F_x` reduces map work and statistics storage but
+does not eliminate the preceding closure computations. `fft_workers` controls
+FFTs, not particle mapping. Particle loops run sequentially on one process.
+
+Box interpolation uses the Cartesian product structure: indices and fractions
+are calculated on three 1D axes, then eight corner contributions are broadcast
+across the cube. This avoids recomputing million-point coordinate/index arrays
+for every corner. The unstructured periodic sampler remains available for
+surface traces and axisymmetric rings. Both paths reject an invalid corner
+when its weight exceeds 1e-14; zero-weight invalid neighbors do not invalidate a
+sample. Unit-weight moment updates use the singleton central-moment recurrence;
+general weighted/grouped merges retain the existing formulas. Roundoff can differ
+from the generic implementation, but the mathematical interpolation/statistics
+are unchanged.
+
+A reproducible benchmark compares the generic path against the optimized path:
+
+```bash
+PYTHONPATH=toolchain python misc/volume_filter/benchmark_maps.py --points 100 --particles 4 --repeats 3
+```
+
+For one scalar field on a 128^3 source grid and four 100^3 particle maps, a local
+three-repeat run measured median mapping times of 2.48 s (generic) and 0.31 s
+(optimized), about 8x faster. Interpolation was 1.95 vs 0.23 s; moment updates
+were 0.52 vs 0.08 s. The script checks counts and central sums against the generic
+path. These are local kernel timings, excluding input reads, full-domain closure
+FFTs, checkpoint output, and production DNS validation.
+
+A 100^3 map contains one million locations, 1000 times a 10^3 map. Mapping cost
+still scales with map locations x particles x selected components x filter
+widths x snapshots. All 59 scalar outputs are selected if `fields` is omitted.
+At 100^3 locations, the two cumulative statistics streams require about 96 MB
+per scalar component/filter, or 5.7 GB for all 59 outputs at one filter width,
+excluding DNS/work arrays and temporaries. The uncompressed checkpoint contains
+about 272 MB per component/filter (17 arrays per stream), or 16 GB for all 59.
+`save_snapshot_maps: true` retains another seven map arrays per component/filter
+until output, about 3.3 GB for all 59 at this resolution. These figures use decimal
+GB and scale linearly with filter count. Restrict `fields` to needed components
+and disable optional snapshot maps when they are not needed. Rewriting large
+checkpoints can dominate runtime even after interpolation is accelerated.
+
 ## Closure conventions
 
 This follows Conrad Delgado's supplied *Volume Filtering* derivation. Let

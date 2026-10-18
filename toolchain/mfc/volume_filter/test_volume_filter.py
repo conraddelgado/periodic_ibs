@@ -186,6 +186,31 @@ class NumericalTests(unittest.TestCase):
         moved = dict(closure_fields(grid, reconstruct(grid, iter(constant), shifted, PHYSICS), shifted, 0.08, {"surface": SURFACE}))
         assert_allclose(moved["F_x"], np.roll(base["F_x"], 3, axis=0), atol=1e-13)
 
+    def test_cartesian_sampler_matches_generic_with_invalid_support(self):
+        grid = Grid((17, 19, 21), (2, 3, 4), (-1, 0.3, 2))
+        rng = np.random.default_rng(12)
+        field = rng.normal(size=grid.shape)
+        field[2, 3, 4] = np.nan
+        field[3, 4, 5] = np.inf
+        valid = rng.random(grid.shape) > 0.1
+        axes = []
+        for d in range(3):
+            cell = d + 2
+            coordinates = grid.origin[d] + grid.dx[d] * (np.array([cell, cell + 0.25, cell - 0.5, cell + 1e-13]) + 0.5)
+            axes.append(np.concatenate([coordinates, coordinates + grid.lengths[d], coordinates - grid.lengths[d]]))
+        points = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+        shape = tuple(len(a) for a in axes)
+        for data in (field, np.asfortranarray(field)):
+            for mask in (None, valid):
+                expected = grid.sample(data, points, mask).reshape(shape)
+                actual = grid.sample_cartesian(data, axes, mask)
+                assert_allclose(actual, expected, rtol=1e-14, atol=1e-14, equal_nan=True)
+        # An invalid neighboring corner with zero interpolation weight is harmless.
+        field = np.ones(grid.shape)
+        field[3, 3, 3] = np.nan
+        axes = [np.array([grid.origin[d] + 2.5 * grid.dx[d]]) for d in range(3)]
+        assert_allclose(grid.sample_cartesian(field, axes), 1)
+
     def test_cubic_map_interpolation_and_periodic_centers(self):
         grid = Grid((20, 20, 20), (1, 1, 1))
         mapper = ParticleMap(grid, {"kind": "box", "length": 0.1, "points": 3})

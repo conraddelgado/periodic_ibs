@@ -71,6 +71,14 @@ class MomentTests(unittest.TestCase):
             self.assert_direct(merged, samples)
             assert_array_equal(merged.count, sequential.count)
 
+    def test_unit_updates_after_weighted_history(self):
+        samples = np.array([[1.0, np.nan], [5.0, 4.0], [-2.0, 8.0], [np.nan, 3.0], [9.0, 2.0]])
+        weights = np.array([[0.2, 0.0], [1.7, 0.8], [1, 1], [1, 1], [1, 1]])
+        result = accumulate(samples[:2], weights[:2])
+        for sample in samples[2:]:
+            result.update(sample)
+        self.assert_direct(result, samples, weights)
+
     def test_weighted_diagnostics_keep_actual_count(self):
         samples = np.array([[1.0, 2.0], [2.0, 5.0], [8.0, np.nan], [-4.0, 7.0]])
         weights = np.array([[0.0, 2.0], [0.5, 3.0], [1.5, 1.0], [4.0, 1.0]])

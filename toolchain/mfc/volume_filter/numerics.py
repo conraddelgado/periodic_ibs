@@ -53,6 +53,34 @@ class Grid:
             result += weight * np.where(np.isfinite(values), values, 0)
         return np.where(good, result, np.nan)
 
+    def sample_cartesian(self, field, axes, valid=None):
+        """Sample a tensor-product grid without materializing pointwise 3D stencils.
+
+        Keep interpolation indices/fractions in 1D, then broadcast the eight
+        corner contributions. Invalid support uses the same rule as sample().
+        """
+        stencils = []
+        for dimension, coordinates in enumerate(axes):
+            q = ((coordinates - self.origin[dimension]) / self.dx[dimension] - 0.5) % self.shape[dimension]
+            lo = np.floor(q).astype(np.int64)
+            fraction = q - lo
+            stencils.append(((lo, (lo + 1) % self.shape[dimension]), (1 - fraction, fraction)))
+        shape = tuple(len(coordinates) for coordinates in axes)
+        result = np.zeros(shape)
+        good = np.ones(shape, dtype=bool)
+        for corner in product((0, 1), repeat=3):
+            index = np.ix_(*(stencils[d][0][c] for d, c in enumerate(corner)))
+            wx, wy, wz = (stencils[d][1][c] for d, c in enumerate(corner))
+            weight = (wx[:, None, None] * wy[None, :, None]) * wz[None, None, :]
+            values = field[index]
+            finite = np.isfinite(values)
+            active = weight > 1e-14
+            good &= ~active | finite
+            if valid is not None:
+                good &= ~active | valid[index]
+            result += weight * np.where(finite, values, 0)
+        return np.where(good, result, np.nan)
+
     def deposit(self, points, strengths):
         """Conservative cloud-in-cell surface-source deposition (per unit volume)."""
         result = np.zeros(self.shape)
