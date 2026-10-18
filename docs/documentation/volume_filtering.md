@@ -16,8 +16,9 @@ snapshots. All spheres use the configured velocity and thermal boundary type.
 Phase change, mixtures, nonideal EOS, variable transport, nonuniform grids, and
 non-spherical bodies require additional reconstruction logic and are not covered.
 
-Execution is **single-node**, with threaded SciPy FFTs (`fft_workers`). One global
-snapshot and several work arrays must fit in RAM. Reading simulation MPI shards
+Execution is **single-node**, with optional independent snapshot processes
+(`--snapshot-workers`) and threaded SciPy FFTs (`fft_workers`). Each worker's global
+snapshot, work arrays, and accumulated moments must fit in RAM. Reading simulation MPI shards
 does not make this a distributed FFT implementation. Memory is independent of the
 number of snapshots; it still grows with grid size, surface quadrature points,
 map size, and the number of retained statistics. A double scalar field on a
@@ -48,7 +49,10 @@ against the case/grid files. No coordinates or precision are guessed from bytes.
 
 Progress is printed and flushed to the terminal or batch-job log automatically.
 The processor reports particle reading, fluid-state reconstruction, each filter's
-closure computation, and final output writing. During map accumulation, each
+closure computation, and final output writing. Startup reports mask construction,
+each conservative-variable read/assembly, velocity reconstruction, and pressure/
+temperature reconstruction with elapsed snapshot times. Each full-domain field
+also reports its computation time before mapping. During map accumulation, each
 snapshot/filter/component reports its own processed-particle counter, for example:
 
 ```text
@@ -71,6 +75,56 @@ The percentage and elapsed time describe the current field's mapping pass, not
 the entire snapshot. Full-domain FFT/closure calculations occur between mapping
 passes and do not have a particle counter. Progress reporting does not change
 numerical results.
+
+For multiple snapshots, independent processes can share one node:
+
+```bash
+# With fft_workers: 16 in the JSON, this starts two processes with eight FFT threads each.
+PYTHONPATH=toolchain python -u -m mfc.volume_filter /path/to/case/closures.json --snapshot-workers 2
+```
+
+`fft_workers` is the total FFT-thread budget: each process receives
+`fft_workers // snapshot_workers` threads. It must be a positive integer at least
+as large as the effective process count, which is capped at the snapshot count.
+The default is one process, preserving the existing threaded execution. Use one
+scheduler task with enough allocated CPUs for that budget; launching multiple
+independent copies with `srun -n N` would duplicate work and race on the output.
+This option uses Python's spawned processes, not MPI or multiple nodes.
+
+Each process handles a round-robin subset of snapshots, sequentially, and retains
+its own cumulative central moments. The parent merges central sums through order
+four, preserving the equal weight of every particle/timestep pair. It does not
+average workers' skewness or kurtosis. The parent alone writes the final output,
+after all workers succeed. Provenance stays in configured snapshot order;
+floating-point grouping can cause small differences from serial results. Worker
+failures abort the run without publishing a final file.
+
+Measure one or two representative snapshots before submitting all snapshots.
+Start with two workers only if memory permits: each duplicates the fluid state,
+FFT/work arrays, and all retained moments. The parent additionally holds one
+merged accumulator and one field's incoming moments during reduction. Increasing
+workers can saturate memory bandwidth or shared storage and is not guaranteed to
+improve throughput. Use the scheduler's total job memory measurement when sizing
+the allocation; one process's peak RSS is not the sum across workers.
+
+To isolate an apparent stall before the first closure, run this read-only
+diagnostic inside the same compute allocation:
+
+```bash
+PYTHONPATH=toolchain python misc/volume_filter/benchmark_startup.py /path/to/case/closures.json
+# Optional shared-file comparison with the former mmap read pattern:
+PYTHONPATH=toolchain python misc/volume_filter/benchmark_startup.py /path/to/case/closures.json --legacy-mmap
+```
+
+It reads the first configured snapshot (or `--step SAVE_INDEX`), builds the mask,
+reconstructs primitives, and reports timings and Linux peak RSS. It performs no
+closure FFTs, mapping, or output writes. The comparison changes only the reader;
+both paths use the current primitive reconstruction. Filesystem cache state and
+contention affect timings, so compare separate processes under similar conditions.
+Shared and sharded restart arrays now use bulk sequential reads before conversion
+from Fortran file layout to C layout in memory. This avoids scattered mmap page
+reads, at the cost of one temporary source component. Pressure reuses the energy
+allocation, and pressure/temperature arithmetic uses bounded slabs.
 
 The processor accumulates statistics in memory over all configured snapshots and
 writes **one final NPZ file only**, after every snapshot succeeds. It does not
@@ -187,7 +241,8 @@ For each configured saved index, the processor:
 closure calculation: unselected fields are still computed/yielded and skipped by
 the caller. Thus selecting only `F_x` reduces map work and statistics storage but
 does not eliminate the preceding closure computations. `fft_workers` controls
-FFTs, not particle mapping. Particle loops run sequentially on one process.
+FFTs, not particle mapping. Particle loops run sequentially within each snapshot
+worker; `--snapshot-workers` parallelizes distinct snapshots.
 
 Box interpolation uses the Cartesian product structure: indices and fractions
 are calculated on three 1D axes, then eight corner contributions are broadcast
@@ -224,7 +279,9 @@ array storage than the earlier 34-array output, while removing the separate
 snapshot-average accumulators halves persistent statistics memory. Output is
 written only once at the end. These figures use decimal GB and scale linearly
 with filter count. Restrict `fields` to needed components to reduce mapping work,
-statistics memory, and final output size.
+statistics memory, and final output size. With multiple snapshot workers, the
+2.8 GB accumulator is replicated per worker/filter and once more in the parent
+during reduction; it is not shared memory.
 
 ## Closure conventions
 
@@ -443,6 +500,9 @@ and `config["map"]["points"]` using the linspace above. Axisymmetric coordinates
 can likewise be reconstructed from the stored extent/count parameters. Metadata
 also records `output_mode: "final_only"`, output format version 3, the key naming
 convention, retained statistic names, and the total completed snapshot count.
+`snapshot_seconds` records each snapshot's processing duration, excluding final
+worker reduction/output. `execution` records the effective process count and
+FFT threads per worker.
 
 The ensemble calculation treats particle/timestep pairs as distinct realizations.
 It does not demonstrate physical independence: nearby particles and closely
@@ -478,7 +538,7 @@ weighting. Existing plotting scripts must switch to the new key names.
 Run the focused suite without compiling MFC:
 
 ```bash
-PYTHONPATH=toolchain python -m unittest mfc.volume_filter.test_volume_filter mfc.volume_filter.test_moments -v
+PYTHONPATH=toolchain python -m unittest mfc.volume_filter.test_volume_filter mfc.volume_filter.test_moments mfc.volume_filter.test_parallel -v
 ```
 
 It exercises Fourier-mode attenuation, filtered momentum and energy identities,
@@ -490,7 +550,9 @@ tests compare streamed and unevenly grouped data with direct sample statistics,
 including nonzero skewness, large mean offsets, missing/constant data, variable
 particle counts, irregular file timestamps, step-only input, ignored legacy times,
 final statistics serialization, compact-output key sets, legacy-file conversion,
-and failure cleanup. These tests
+and failure cleanup. Spawned-worker tests compare all four final statistics with
+serial results across multiple filters and changing particle counts, check ordered
+provenance, and exercise worker failure without a final write. These tests
 establish numerical contracts; they do not replace a DNS comparison or a grid/
 filter/quadrature convergence study. For complete equation-balance tests, also
 include the simulation's external forcing and enough snapshots to estimate time

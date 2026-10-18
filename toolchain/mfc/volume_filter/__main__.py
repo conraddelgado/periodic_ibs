@@ -1,6 +1,7 @@
 """Run with PYTHONPATH=toolchain python -m mfc.volume_filter config.json."""
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -98,15 +99,63 @@ def pack(moments, metadata):
             yield KEY_FORMAT.format(field=name, statistic=statistic, filter_index=sigma_index), array
 
 
-def run(config_path, progress_interval=5.0):
+def process_snapshots(config, root, indices, progress_interval, worker_id=None):
+    """Process one snapshot at a time within one independent worker."""
+    grid = Grid(**config["grid"])
+    reader = Reader(config["io"], grid, root)
+    mapper = ParticleMap(grid, config["map"])
+    moments, records = {}, []
+    selected = set(config.get("fields", []))
+    for index in indices:
+        step = config["snapshots"][index]
+        snapshot_start = perf_counter()
+        label = f"Snapshot {index + 1}/{len(config['snapshots'])} step={step}"
+        if worker_id is not None:
+            label = f"Worker {worker_id} {label}"
+
+        def report(message):
+            print(f"{label}: {message} [snapshot elapsed {perf_counter() - snapshot_start:.2f}s]", flush=True)
+
+        report("reading particle state")
+        fingerprint = reader.fingerprint(step)
+        particles = reader.particles(step)
+        time = float(particles[0, 0])  # File timestamp is descriptive metadata only.
+        print(f"{label}: time={time}, particles={len(particles)}; reading/reconstructing fluid state", flush=True)
+        state = reconstruct(grid, reader.fields(step, report=report), particles, config["physics"], report=report)
+        for sigma_index, sigma in enumerate(config["sigmas"]):
+            filter_label = f"{label} filter={sigma_index + 1}/{len(config['sigmas'])} sigma={sigma}"
+            print(f"{filter_label}: computing full-domain closure fields and mapping particles", flush=True)
+            seen = set()
+            compute_start = perf_counter()
+            for name, field in closure_fields(grid, state, particles, sigma, config):
+                report(f"filter {sigma_index + 1} {name}: full-domain field ready in {perf_counter() - compute_start:.2f}s")
+                seen.add(name)
+                if selected and name not in selected:
+                    compute_start = perf_counter()
+                    continue
+                particle = mapper.particles(field, particles, progress=ParticleProgress(f"{filter_label} {name}", progress_interval))
+                key = (name, sigma_index)
+                if key not in moments:
+                    moments[key] = particle
+                else:
+                    moments[key].merge(particle)
+                compute_start = perf_counter()
+            if selected - seen:
+                raise ValueError(f"Unknown fields: {sorted(selected - seen)}")
+        del state
+        if reader.fingerprint(step) != fingerprint:
+            raise ValueError("Input changed while processing; only consume completed snapshots")
+        records.append({"index": index, "inputs": fingerprint, "particle_count": len(particles), "time": time, "seconds": perf_counter() - snapshot_start})
+        report("complete; statistics retained in memory")
+    return moments, records
+
+
+def run(config_path, progress_interval=5.0, snapshot_workers=1):
     if not np.isfinite(progress_interval) or progress_interval < 0:
         raise ValueError("progress_interval must be finite and nonnegative")
     config_path = Path(config_path).resolve()
     config = json.loads(config_path.read_text())
     validate(config)
-    grid = Grid(**config["grid"])
-    reader = Reader(config["io"], grid, config_path.parent)
-    mapper = ParticleMap(grid, config["map"])
     output = config_path.parent / config["output"]
     if output.exists():
         raise FileExistsError(f"{output} exists; select a new output path or remove the old file")
@@ -130,40 +179,30 @@ def run(config_path, progress_interval=5.0):
         "particle_counts": [],
         "snapshot_times": [],
     }
-    moments = {}
-    selected = set(config.get("fields", []))
-    for index, step in enumerate(config["snapshots"]):
-        label = f"Snapshot {index + 1}/{len(config['snapshots'])} step={step}"
-        print(f"{label}: reading particle state", flush=True)
-        fingerprint = reader.fingerprint(step)
-        particles = reader.particles(step)
-        time = float(particles[0, 0])  # File timestamp is descriptive metadata only.
-        print(f"{label}: time={time}, particles={len(particles)}; reading/reconstructing fluid state", flush=True)
-        state = reconstruct(grid, reader.fields(step), particles, config["physics"])
-        for sigma_index, sigma in enumerate(config["sigmas"]):
-            filter_label = f"{label} filter={sigma_index + 1}/{len(config['sigmas'])} sigma={sigma}"
-            print(f"{filter_label}: computing full-domain closure fields and mapping particles", flush=True)
-            seen = set()
-            for name, field in closure_fields(grid, state, particles, sigma, config):
-                seen.add(name)
-                if selected and name not in selected:
-                    continue
-                particle = mapper.particles(field, particles, progress=ParticleProgress(f"{filter_label} {name}", progress_interval))
-                key = (name, sigma_index)
-                if key not in moments:
-                    moments[key] = particle
-                else:
-                    moments[key].merge(particle)
-            if selected - seen:
-                raise ValueError(f"Unknown fields: {sorted(selected - seen)}")
-        del state
-        if reader.fingerprint(step) != fingerprint:
-            raise ValueError("Input changed while processing; only consume completed snapshots")
-        metadata["completed"] = index + 1
-        metadata["inputs"].append(fingerprint)
-        metadata["particle_counts"].append(len(particles))
-        metadata["snapshot_times"].append(time)
-        print(f"{label}: complete; statistics retained in memory", flush=True)
+    if type(snapshot_workers) is not int or snapshot_workers < 1:
+        raise ValueError("snapshot_workers must be a positive integer")
+    workers = min(snapshot_workers, len(config["snapshots"]))
+    worker_config = copy.deepcopy(config)
+    budget = config.get("fft_workers", 1)
+    if workers > 1:
+        if type(budget) is not int or budget < workers:
+            raise ValueError("fft_workers is the total CPU budget and must be >= snapshot_workers")
+        worker_config["fft_workers"] = budget // workers
+        from .parallel import run_workers
+
+        print(f"Processing with {workers} snapshot workers, {worker_config['fft_workers']} FFT threads each", flush=True)
+        moments, records = run_workers(worker_config, config_path.parent, workers, progress_interval)
+    else:
+        moments, records = process_snapshots(worker_config, config_path.parent, range(len(config["snapshots"])), progress_interval)
+    records.sort(key=lambda item: item["index"])
+    if [item["index"] for item in records] != list(range(len(config["snapshots"]))):
+        raise RuntimeError("Snapshot workers did not cover each configured snapshot exactly once")
+    metadata["completed"] = len(records)
+    metadata["inputs"] = [item["inputs"] for item in records]
+    metadata["particle_counts"] = [item["particle_count"] for item in records]
+    metadata["snapshot_times"] = [item["time"] for item in records]
+    metadata["snapshot_seconds"] = [item["seconds"] for item in records]
+    metadata["execution"] = {"snapshot_workers": workers, "fft_workers_per_worker": worker_config.get("fft_workers", 1)}
     print(f"Writing final statistics: {output}", flush=True)
     atomic_save(output, pack(moments, metadata))
     print(f"Final output saved: {output}", flush=True)
@@ -174,10 +213,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path)
     parser.add_argument("--progress-interval", type=float, default=5.0, help="Seconds between particle progress lines (default: 5; 0 prints every particle)")
+    parser.add_argument("--snapshot-workers", type=int, default=1, help="Independent snapshot processes on this node (default: 1); fft_workers is their total CPU budget")
     args = parser.parse_args()
     if not np.isfinite(args.progress_interval) or args.progress_interval < 0:
         parser.error("--progress-interval must be finite and nonnegative")
-    run(args.config, progress_interval=args.progress_interval)
+    if args.snapshot_workers < 1:
+        parser.error("--snapshot-workers must be positive")
+    run(args.config, progress_interval=args.progress_interval, snapshot_workers=args.snapshot_workers)
 
 
 if __name__ == "__main__":

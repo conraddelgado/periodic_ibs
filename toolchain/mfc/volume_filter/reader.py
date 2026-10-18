@@ -1,6 +1,7 @@
 """Explicit-layout readers for MFC native restart files; no equation-index guessing."""
 
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 from scipy.io import FortranFile
@@ -109,9 +110,12 @@ class Reader:
             raise ValueError("Invalid particle state; check precision and missing records")
         return states
 
-    def fields(self, step):
+    def fields(self, step, report=None):
         """Yield rho, three momenta, rho E as float64 global cell arrays."""
         for var in self.indices:
+            start = perf_counter()
+            if report is not None:
+                report(f"reading conservative variable {var}")
             result = np.empty(self.grid.shape)
             for block in self.blocks:
                 shape = tuple(block["shape"])
@@ -124,7 +128,15 @@ class Reader:
                 else:
                     if path.stat().st_size != count * self.config["nvars"] * self.dtype.itemsize:
                         raise ValueError(f"Incorrect restart size: {path}; check grid, nvars, precision, and downsampling")
-                    raw = np.memmap(path, dtype=self.dtype, mode="r", offset=(var - 1) * count * self.dtype.itemsize, shape=(count,))
+                    # Bulk sequential I/O before the F-to-C layout conversion.
+                    # A strided copy directly from a Lustre-backed mmap can
+                    # otherwise trigger many small, scattered page reads.
+                    raw = np.fromfile(path, dtype=self.dtype, count=count, offset=(var - 1) * count * self.dtype.itemsize)
+                    if raw.size != count:
+                        raise ValueError(f"Truncated restart variable {var}: {path}")
                 sl = tuple(slice(a, a + n) for a, n in zip(block["offset"], shape))
                 result[sl] = raw.reshape(shape, order="F")
+                del raw
+            if report is not None:
+                report(f"conservative variable {var} read/assembled in {perf_counter() - start:.2f}s")
             yield result
