@@ -20,7 +20,27 @@ class Moments:
 
     def update(self, value, weight=1.0):
         """Add one realization per map location; ignore nonfinite observations."""
-        self._combine(value, weight, 1, 0.0, 0.0, 0.0)
+        if np.ndim(weight) == 0 and weight == 1:
+            self._update_unit(value)
+        else:
+            self._combine(value, weight, 1, 0.0, 0.0, 0.0)
+
+    def _update_unit(self, value):
+        """Singleton central-moment recurrence without general merge temporaries."""
+        good = np.isfinite(value)
+        total = self.weight + good
+        first = good & (self.weight == 0)
+        delta = np.where(good & ~first, value - self.mean, 0)
+        delta_n = np.divide(delta, total, out=np.zeros_like(self.mean), where=total > 0)
+        delta_n2 = delta_n * delta_n
+        term = delta * delta_n * self.weight
+        # Higher orders need the old lower-order central sums.
+        self.m4 += term * delta_n2 * (total * total - 3 * total + 3) + 6 * delta_n2 * self.m2 - 4 * delta_n * self.m3
+        self.m3 += term * delta_n * (total - 2) - 3 * delta_n * self.m2
+        self.m2 += term
+        self.mean = np.where(first, value, self.mean + delta_n)
+        self.weight = total
+        self.count += good
 
     def merge(self, other):
         """Combine complete distributions, including their within-group scatter."""
@@ -108,6 +128,7 @@ class ParticleMap:
             if length >= min(grid.lengths):
                 raise ValueError("Box map length must be smaller than every periodic domain length")
             axis = np.linspace(-length / 2, length / 2, points)
+            self.box_axis = axis
             self.shape = (points, points, points)
             self.offsets = np.stack(np.meshgrid(axis, axis, axis, indexing="ij"), axis=-1).reshape(-1, 3)
         elif self.mode == "axisymmetric":
@@ -143,14 +164,20 @@ class ParticleMap:
         if np.any(np.max(np.abs(self.offsets), axis=0) >= np.asarray(grid.lengths) / 2):
             raise ValueError("Map offsets must stay within half the box length to avoid repeated periodic images")
 
-    def particles(self, field, states):
+    def particles(self, field, states, progress=None):
         result = Moments(self.shape)
-        for particle in states:
-            value = self.grid.sample(field, particle[16:19] + self.offsets)
-            if self.mode == "axisymmetric":
+        total = len(states)
+        if progress is not None:
+            progress(0, total)
+        for completed, particle in enumerate(states, 1):
+            if self.mode == "box":
+                axes = [self.box_axis + coordinate for coordinate in particle[16:19]]
+                value = self.grid.sample_cartesian(field, axes)
+            else:
+                value = self.grid.sample(field, particle[16:19] + self.offsets)
                 # Reject an incomplete ring; do not bias an angular average by masking angles.
                 value = np.mean(value.reshape(*self.shape, self.ntheta), axis=-1)
-            else:
-                value = value.reshape(self.shape)
             result.update(value)
+            if progress is not None:
+                progress(completed, total)
         return result

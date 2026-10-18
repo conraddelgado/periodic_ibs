@@ -46,23 +46,46 @@ input**; `gamma` is the physical heat-capacity ratio, not MFC's stored 1/(gamma-
 The grid in the JSON is an explicit assertion of the saved mesh: verify it
 against the case/grid files. No coordinates or precision are guessed from bytes.
 
-```bash
-# Process a bounded number of new snapshots, then continue in another job.
-PYTHONPATH=toolchain python -m mfc.volume_filter /path/to/case/closures.json --max-snapshots 10
-PYTHONPATH=toolchain python -m mfc.volume_filter /path/to/case/closures.json --resume
+Progress is printed and flushed to the terminal or batch-job log automatically.
+The processor reports particle reading, fluid-state reconstruction, each filter's
+closure computation, and final output writing. During map accumulation, each
+snapshot/filter/component reports its own processed-particle counter, for example:
+
+```text
+Snapshot 1/3 step=1000 filter=1/2 sigma=0.025 F_x: particles 143/1000 (14.3%), elapsed 5.0s
 ```
 
-Only consume completely written, immutable snapshots. Checkpoints are replaced
-atomically after all filter widths and selected maps for a snapshot succeed.
-Resume checks the complete configuration, format version, and processed input
-paths/sizes/modification times. It does not re-count completed snapshots. Changing
-the configuration (including its snapshot list) requires a new output path.
-Version 2 checkpoints retain central sums through order four and realization
-counts. Version 1 checkpoints cannot be upgraded from means/variances alone;
-reprocess the raw snapshots into a new output file. Keep the full planned snapshot
-list when using `--max-snapshots`. Only one job
-may write a particular output path. Interrupted temporary files can be removed
-once that writer is no longer running. Raw input files are never deleted.
+Each counter starts at zero and ends at the total particle count. Intermediate
+updates are limited to one every five seconds, checked after each particle
+finishes. Override the interval without changing the configuration:
+
+```bash
+PYTHONPATH=toolchain python -m mfc.volume_filter /path/to/case/closures.json --progress-interval 1
+```
+
+Use `--progress-interval 0` to print every particle. Counts reset for each field
+and filter because the code maps one full-domain closure component at a time.
+They count processed particles, including any with invalid map locations; valid
+statistical support is still recorded separately in the output count arrays.
+The percentage and elapsed time describe the current field's mapping pass, not
+the entire snapshot. Full-domain FFT/closure calculations occur between mapping
+passes and do not have a particle counter. Progress reporting does not change
+numerical results.
+
+The processor accumulates statistics in memory over all configured snapshots and
+writes **one final NPZ file only**, after every snapshot succeeds. It does not
+write checkpoints or per-snapshot map files. Final output is streamed to a
+temporary file, flushed, and atomically published under the configured name;
+the temporary file is not a recoverable checkpoint. An interrupted or failed run
+must restart from the first configured snapshot. The removed `--resume` and
+`--max-snapshots` options are no longer accepted. Legacy `save_snapshot_maps`
+configuration entries are ignored and can be deleted.
+
+Only consume completely written, immutable snapshots. Input fingerprints are
+recorded as provenance, and each snapshot is checked for changes during
+processing. Existing output files are refused; choose a new output path or
+remove the old file before running. Only one job may write a particular output
+path. Raw simulation files are never deleted.
 
 ## Native output layouts
 
@@ -126,11 +149,8 @@ files come from the same saved output.
 Legacy objects such as `{"step": 1000}` or `{"step": 1000, "time": 0.001}`
 are also accepted. Any supplied `time` is ignored, including stale example times.
 Legacy `time_weighting` is ignored as well: all realizations have equal weight.
-These obsolete fields are removed before configuration hashing, so adding or
-removing them does not affect a new checkpoint's resumability. Checkpoints made
-before this step-only input change have a different configuration hash; reprocess
-into a new output path rather than combining old weighted diagnostics with new
-ones.
+These obsolete fields are removed before recording the normalized configuration.
+Physical time is retained only as descriptive metadata read from the files.
 
 The 20 fields are time, force(3), torque(3), velocity(3), angular_velocity(3),
 angles(3), centroid(3), radius. The geometry and kinematics are used directly.
@@ -138,6 +158,72 @@ Forces and torques are retained in the input, but never substituted for distribu
 surface traction. MFC's force history has stage-timing considerations; its
 `patch_ib%%force` can also include collisions/body forces. Such values are not
 unconditionally valid hydrodynamic force checks.
+
+## Execution order and map performance
+
+For each configured saved index, the processor:
+
+1. Reads particle state, builds the periodic fluid/solid mask, and reads the five
+   conservative fluid components. Reconstructs velocity, pressure, and temperature.
+2. For each filter width, constructs the Gaussian Fourier multiplier and filters
+   the fluid indicator, density, momentum, and pressure. Produces alpha, intrinsic
+   density, Favre velocity components, and Favre temperature.
+3. Builds surface quadrature and reconstructed traces, then yields closure
+   components sequentially: R_u and R_mu tensor components; R_uu, R_Tu, R_tau_u,
+   and R_q vector components; finally F_x/F_y/F_z, Q, and F_u. Intrinsic R terms
+   also yield their alpha-weighted companions. Dependencies and work arrays are
+   retained as needed, but all resulting full-domain components are not stored
+   simultaneously.
+4. For each selected yielded component, loops over particles. Samples the closure
+   at the particle-centered map, averages theta first for axisymmetric maps, then
+   updates pointwise count, mean, and central sums through order four. There is
+   no Python loop over the individual interpolation points.
+5. Merges that particle distribution into the pooled accumulator and separately
+   accumulates the particle-average map into the snapshot diagnostic.
+6. Continues to the next saved index without writing map data. After every
+   snapshot/filter/component finishes, writes one final statistics file.
+
+`fields` currently selects **mapping and storage**, not a dependency-pruned
+closure calculation: unselected fields are still computed/yielded and skipped by
+the caller. Thus selecting only `F_x` reduces map work and statistics storage but
+does not eliminate the preceding closure computations. `fft_workers` controls
+FFTs, not particle mapping. Particle loops run sequentially on one process.
+
+Box interpolation uses the Cartesian product structure: indices and fractions
+are calculated on three 1D axes, then eight corner contributions are broadcast
+across the cube. This avoids recomputing million-point coordinate/index arrays
+for every corner. The unstructured periodic sampler remains available for
+surface traces and axisymmetric rings. Both paths reject an invalid corner
+when its weight exceeds 1e-14; zero-weight invalid neighbors do not invalidate a
+sample. Unit-weight moment updates use the singleton central-moment recurrence;
+general weighted/grouped merges retain the existing formulas. Roundoff can differ
+from the generic implementation, but the mathematical interpolation/statistics
+are unchanged.
+
+A reproducible benchmark compares the generic path against the optimized path:
+
+```bash
+PYTHONPATH=toolchain python misc/volume_filter/benchmark_maps.py --points 100 --particles 4 --repeats 3
+```
+
+For one scalar field on a 128^3 source grid and four 100^3 particle maps, a local
+three-repeat run measured median mapping times of 2.48 s (generic) and 0.31 s
+(optimized), about 8x faster. Interpolation was 1.95 vs 0.23 s; moment updates
+were 0.52 vs 0.08 s. The script checks counts and central sums against the generic
+path. These are local kernel timings, excluding input reads, full-domain closure
+FFTs, final output, and production DNS validation.
+
+A 100^3 map contains one million locations, 1000 times a 10^3 map. Mapping cost
+still scales with map locations x particles x selected components x filter
+widths x snapshots. All 59 scalar outputs are selected if `fields` is omitted.
+At 100^3 locations, the two cumulative statistics streams require about 96 MB
+per scalar component/filter, or 5.7 GB for all 59 outputs at one filter width,
+excluding DNS/work arrays and temporaries. The uncompressed final output contains
+about 272 MB per component/filter (17 arrays per stream), or 16 GB for all 59.
+It is written only once at the end. No per-snapshot maps are retained or written.
+These figures use decimal GB and scale linearly with filter count. Restrict
+`fields` to needed components to reduce mapping work, statistics memory, and
+final output size.
 
 ## Closure conventions
 
@@ -322,10 +408,10 @@ sums directly rather than obtaining them by cancellation of large raw powers.
 The raw moments are derived only for output. All accumulators use float64, with
 int64 valid-realization counts, and memory remains independent of the number of
 snapshots. Two extra central-sum arrays and a count array are retained per
-accumulator; checkpoint entries are streamed instead of duplicating every derived
+accumulator; final output entries are streamed instead of duplicating every derived
 output in memory.
 
-For each filter/component, the NPZ checkpoint contains:
+For each filter/component, the final NPZ contains:
 
 | Suffix under `sigma0.R_u_xx.pooled` | Meaning |
 |---|---|
@@ -336,7 +422,7 @@ For each filter/component, the NPZ checkpoint contains:
 | `.central_moment3`, `.central_moment4` | Unstandardized third and fourth central moments |
 | `.skewness`, `.kurtosis`, `.excess_kurtosis` | Standardized shape statistics |
 | `.raw_moment1` through `.raw_moment4` | Raw moments E[X^r] |
-| `.m2`, `.m3`, `.m4` | Unnormalized central sums used for checkpoint/resume |
+| `.m2`, `.m3`, `.m4` | Unnormalized central sums |
 
 An empty location has NaN mean/moments and zero count. A constant realization
 sequence has zero central moments and **NaN skewness/kurtosis**, because its
@@ -361,10 +447,8 @@ transients by selecting the desired saved file indices.
 particle counts, file-derived `snapshot_times`, input fingerprints, and explicit ensemble/normalization
 conventions. Box coordinates can be reconstructed from `config["map"]["length"]`
 and `config["map"]["points"]` using the linspace above. Axisymmetric coordinates
-can likewise be reconstructed from the stored extent/count parameters. Setting
-`save_snapshot_maps: true` additionally writes each snapshot's particle mean,
-variance, count, central moments 3-4, skewness, and Pearson kurtosis, together
-with the step/time. Those files can support later stationarity studies.
+can likewise be reconstructed from the stored extent/count parameters. Metadata
+also records `output_mode: "final_only"` and the total completed snapshot count.
 
 The ensemble calculation treats particle/timestep pairs as distinct realizations.
 It does not demonstrate physical independence: nearby particles and closely
@@ -399,11 +483,11 @@ It exercises Fourier-mode attenuation, filtered momentum and energy identities,
 fluid-only differences, cubic mesh construction, affine interpolation, periodic
 particle registration, conservative deposition, analytic
 surface-force/power integrals, map statistics, shared/sharded/Fortran-record input,
-and equality of uninterrupted versus checkpoint/resume processing. Higher-moment
+and a single final write after all snapshots complete. Higher-moment
 tests compare streamed and unevenly grouped data with direct sample statistics,
 including nonzero skewness, large mean offsets, missing/constant data, variable
 particle counts, irregular file timestamps, step-only input, ignored legacy times,
-and legacy-checkpoint rejection. These tests
+final statistics serialization, and failure cleanup. These tests
 establish numerical contracts; they do not replace a DNS comparison or a grid/
 filter/quadrature convergence study. For complete equation-balance tests, also
 include the simulation's external forcing and enough snapshots to estimate time

@@ -72,6 +72,5 @@
     "radial_points": 11,
     "azimuthal_points": 32
   },
-  "save_snapshot_maps": true,
   "output": "closure_statistics_axisymmetric.npz"
 }
