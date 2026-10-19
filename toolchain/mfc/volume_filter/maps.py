@@ -114,8 +114,13 @@ class ParticleMap:
     statistics; vector/tensor components remain Cartesian (explicitly labelled).
     """
 
-    def __init__(self, grid, config):
+    def __init__(self, grid, config, workers=1):
         self.grid, self.config = grid, config
+        self.workers = workers
+        self.backend = config.get("backend", "auto")
+        if self.backend not in ("auto", "numpy", "numba"):
+            raise ValueError("map.backend must be auto, numpy, or numba")
+        self._compiled = None
         self.mode = config["kind"]
         if self.mode == "box":
             if any(name in config for name in ("x", "y", "z")):
@@ -163,12 +168,30 @@ class ParticleMap:
             raise ValueError("map.kind must be box or axisymmetric")
         if np.any(np.max(np.abs(self.offsets), axis=0) >= np.asarray(grid.lengths) / 2):
             raise ValueError("Map offsets must stay within half the box length to avoid repeated periodic images")
+        if self.backend == "numba" and self.mode != "box":
+            raise ValueError("map.backend=numba currently requires a box map; use auto or numpy for axisymmetric maps")
+        if self.mode == "box" and self.backend != "numpy":
+            try:
+                from .numba_mapping import map_box
+            except ModuleNotFoundError as error:
+                if error.name != "numba":
+                    raise
+                if self.backend == "numba":
+                    raise ValueError("map.backend=numba requires numba; install numba or select numpy") from error
+            else:
+                self._compiled = map_box
+        self.backend = "numba" if self._compiled is not None else "numpy"
 
     def particles(self, field, states, progress=None):
         result = Moments(self.shape)
         total = len(states)
         if progress is not None:
             progress(0, total)
+        if self._compiled is not None:
+            self._compiled(self.grid, self.box_axis, field, states, result, workers=self.workers)
+            if progress is not None:
+                progress(total, total)
+            return result
         for completed, particle in enumerate(states, 1):
             if self.mode == "box":
                 axes = [self.box_axis + coordinate for coordinate in particle[16:19]]

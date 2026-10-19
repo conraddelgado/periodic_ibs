@@ -215,9 +215,11 @@ class MomentTests(unittest.TestCase):
                     self.assertEqual(log.count(f"{label}: reading particle state"), 1)
                     for j, sigma in enumerate(cfg["sigmas"], 1):
                         prefix = f"{label} filter={j}/2 sigma={sigma} F_x: particles"
-                        for completed in range(len(centers) + 1):
-                            self.assertEqual(log.count(f"{prefix} {completed}/{len(centers)} ("), 1)
+                        self.assertEqual(log.count(prefix), 1)
+                        self.assertIn(f"{prefix} {len(centers)}/{len(centers)}; compute", log)
                     self.assertIn(f"{label}: complete; statistics retained in memory", log)
+                self.assertNotIn("full-domain field ready", log)
+                self.assertNotIn("(100.0%)", log)
                 with np.load(root / cfg["output"]) as data:
                     metadata = json.loads(str(data["metadata"]))
                     self.assertEqual(metadata["snapshot_times"], times)

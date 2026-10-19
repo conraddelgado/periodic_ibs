@@ -1,5 +1,6 @@
 """Periodic filtering, fluid-side differences, interpolation, and deposition."""
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from itertools import product
 
@@ -157,3 +158,25 @@ class Gaussian:
         spectrum = fft.rfftn(field, workers=self.workers)
         spectrum *= 1j * self.wave[axis]
         return fft.irfftn(spectrum, s=self.grid.shape, workers=self.workers)
+
+
+class SpectralDerivatives:
+    """Reuse at most two forward FFTs of immutable filtered closure fields."""
+
+    def __init__(self, gaussian):
+        self.gaussian = gaussian
+        self.spectra = OrderedDict()
+
+    def derivative(self, field, axis):
+        key = id(field)
+        if key not in self.spectra:
+            if len(self.spectra) == 2:
+                self.spectra.popitem(last=False)
+            # Retain the field as well: its identity cannot be recycled while cached.
+            self.spectra[key] = (field, fft.rfftn(field, workers=self.gaussian.workers))
+        self.spectra.move_to_end(key)
+        spectrum = self.spectra[key][1]
+        return fft.irfftn(spectrum * (1j * self.gaussian.wave[axis]), s=self.gaussian.grid.shape, workers=self.gaussian.workers)
+
+    def clear(self):
+        self.spectra.clear()

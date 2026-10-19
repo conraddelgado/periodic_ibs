@@ -21,22 +21,6 @@ STATISTICS = ("mean", "variance", "skewness", "kurtosis")
 KEY_FORMAT = "{field}.{statistic}.sigma{filter_index}"
 
 
-class ParticleProgress:
-    """Flush periodic particle counts to terminals and batch-job logs."""
-
-    def __init__(self, label, interval):
-        self.label, self.interval = label, interval
-        self.start = self.last = perf_counter()
-
-    def __call__(self, completed, total):
-        now = perf_counter()
-        if completed not in (0, total) and now - self.last < self.interval:
-            return
-        percent = 100 * completed / total if total else 100.0
-        print(f"{self.label}: particles {completed}/{total} ({percent:.1f}%), elapsed {now - self.start:.1f}s", flush=True)
-        self.last = now
-
-
 def atomic_save(path, arrays):
     """Publish final output only after a complete write and flush."""
     path = Path(path)
@@ -103,7 +87,7 @@ def process_snapshots(config, root, indices, progress_interval, worker_id=None):
     """Process one snapshot at a time within one independent worker."""
     grid = Grid(**config["grid"])
     reader = Reader(config["io"], grid, root)
-    mapper = ParticleMap(grid, config["map"])
+    mapper = ParticleMap(grid, config["map"], workers=config.get("fft_workers", 1))
     moments, records = {}, []
     selected = set(config.get("fields", []))
     for index in indices:
@@ -120,32 +104,34 @@ def process_snapshots(config, root, indices, progress_interval, worker_id=None):
         fingerprint = reader.fingerprint(step)
         particles = reader.particles(step)
         time = float(particles[0, 0])  # File timestamp is descriptive metadata only.
-        print(f"{label}: time={time}, particles={len(particles)}; reading/reconstructing fluid state", flush=True)
-        state = reconstruct(grid, reader.fields(step, report=report), particles, config["physics"], report=report)
+        state = reconstruct(grid, reader.fields(step), particles, config["physics"])
+        report(f"fluid ready; time={time}, particles={len(particles)}, map backend={mapper.backend}")
         for sigma_index, sigma in enumerate(config["sigmas"]):
             filter_label = f"{label} filter={sigma_index + 1}/{len(config['sigmas'])} sigma={sigma}"
             print(f"{filter_label}: computing full-domain closure fields and mapping particles", flush=True)
             seen = set()
             compute_start = perf_counter()
             for name, field in closure_fields(grid, state, particles, sigma, config):
-                report(f"filter {sigma_index + 1} {name}: full-domain field ready in {perf_counter() - compute_start:.2f}s")
+                compute_seconds = perf_counter() - compute_start
                 seen.add(name)
                 if selected and name not in selected:
                     compute_start = perf_counter()
                     continue
-                particle = mapper.particles(field, particles, progress=ParticleProgress(f"{filter_label} {name}", progress_interval))
+                map_start = perf_counter()
+                particle = mapper.particles(field, particles)
                 key = (name, sigma_index)
                 if key not in moments:
                     moments[key] = particle
                 else:
                     moments[key].merge(particle)
+                print(f"{filter_label} {name}: particles {len(particles)}/{len(particles)}; compute {compute_seconds:.2f}s, map/stats {perf_counter() - map_start:.2f}s", flush=True)
                 compute_start = perf_counter()
             if selected - seen:
                 raise ValueError(f"Unknown fields: {sorted(selected - seen)}")
         del state
         if reader.fingerprint(step) != fingerprint:
             raise ValueError("Input changed while processing; only consume completed snapshots")
-        records.append({"index": index, "inputs": fingerprint, "particle_count": len(particles), "time": time, "seconds": perf_counter() - snapshot_start})
+        records.append({"index": index, "inputs": fingerprint, "particle_count": len(particles), "time": time, "seconds": perf_counter() - snapshot_start, "map_backend": mapper.backend})
         report("complete; statistics retained in memory")
     return moments, records
 
@@ -202,7 +188,7 @@ def run(config_path, progress_interval=5.0, snapshot_workers=1):
     metadata["particle_counts"] = [item["particle_count"] for item in records]
     metadata["snapshot_times"] = [item["time"] for item in records]
     metadata["snapshot_seconds"] = [item["seconds"] for item in records]
-    metadata["execution"] = {"snapshot_workers": workers, "fft_workers_per_worker": worker_config.get("fft_workers", 1)}
+    metadata["execution"] = {"snapshot_workers": workers, "fft_workers_per_worker": worker_config.get("fft_workers", 1), "map_backend": records[0]["map_backend"]}
     print(f"Writing final statistics: {output}", flush=True)
     atomic_save(output, pack(moments, metadata))
     print(f"Final output saved: {output}", flush=True)
@@ -212,7 +198,7 @@ def run(config_path, progress_interval=5.0, snapshot_workers=1):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path)
-    parser.add_argument("--progress-interval", type=float, default=5.0, help="Seconds between particle progress lines (default: 5; 0 prints every particle)")
+    parser.add_argument("--progress-interval", type=float, default=5.0, help="Deprecated compatibility option; each selected field now prints one completion line")
     parser.add_argument("--snapshot-workers", type=int, default=1, help="Independent snapshot processes on this node (default: 1); fft_workers is their total CPU budget")
     args = parser.parse_args()
     if not np.isfinite(args.progress_interval) or args.progress_interval < 0:
