@@ -522,11 +522,13 @@ The version-3 NPZ uses **field, statistic, filter index** ordering:
 | `F_x.kurtosis.sigma0` | Pearson kurtosis of F_x |
 | `R_u_xy.mean.sigma1` | Mean xy momentum-flux closure at the second filter width |
 
-`metadata` is the only entry other than these four statistics per selected
-field/filter. No `.time`, `.pooled`, raw moments, central moments, counts,
+Each selected map field/filter has these four statistics. The file additionally
+contains `metadata` and the scalar particle-force/torque statistics described
+below. No `.time`, `.pooled`, raw moments, central moments, counts,
 weights, central sums, or excess-kurtosis arrays are saved. All statistics use
 the equally weighted particle/timestep ensemble. With all 59 fields and one
-filter width, the NPZ has 237 keys including metadata, versus 2007 previously.
+filter width, the NPZ has 261 keys including metadata and 24 particle-load scalars
+(237 keys before particle-load statistics were added).
 
 An unsupported location has NaN statistics. A constant realization sequence has
 zero variance and NaN skewness/kurtosis. Invalid samples are excluded separately
@@ -555,6 +557,53 @@ It does not demonstrate physical independence: nearby particles and closely
 spaced times may be correlated. No effective sample size, confidence intervals,
 or autocorrelation estimates are inferred.
 
+### Scalar particle forces and torques
+
+Each run also accumulates the three signed force and three signed torque
+components saved in `ib_state`: one-based record fields 2--4 and 5--7,
+respectively. Each particle/timestep pair has unit weight, including when the
+particle count changes between snapshots. No particle averaging precedes the
+moment calculation. Independent snapshot workers merge the same central moments
+used for map statistics.
+
+There are **24 scalar entries**, four statistics for each component:
+
+| Example key | Meaning |
+|---|---|
+| `particle_force_y.mean` | Mean saved y force across all particle/timestep pairs |
+| `particle_force_y.variance` | Population variance of that force |
+| `particle_force_y.skewness` | Standardized third central moment |
+| `particle_force_y.kurtosis` | Pearson kurtosis |
+| `particle_torque_z.mean` | Mean saved z torque |
+
+The component names are `particle_force_x/y/z` and `particle_torque_x/y/z`.
+Each entry is a zero-dimensional NumPy array (`shape == ()`); use `.item()` to
+obtain a Python scalar. These quantities have no spatial-map coordinates and no
+filter dependence, so their keys have no `.sigma` suffix. They are accumulated
+once per snapshot, independently of the map's `fields` selection and number of
+filter widths. No additional input files or configuration options are needed.
+Only the same four statistics are saved, in the single final NPZ file.
+
+The values retain the saved units and sign conventions. They are not
+nondimensional drag/lift coefficients or reconstructed surface-source integrals.
+MFC's saved force can include collision/body-force contributions and has the
+stage-timing considerations noted above. Constant components have zero variance
+and NaN skewness/kurtosis. Metadata's `particle_statistics` describes the source,
+record columns, scalar key format, and total realization count. Older version-3
+files and converted version-2 files lack these newly added entries.
+
+Plotting loops should handle scalars before parsing map keys or slicing arrays:
+
+```python
+if key == "metadata":
+    continue
+F = data[key]
+if F.ndim == 0:
+    print(key, F.item())
+    continue
+# Format the field/statistic/filter map key and plot F here.
+```
+
 ```python
 import json
 import numpy as np
@@ -565,6 +614,8 @@ with np.load("closure_statistics.npz", allow_pickle=False) as data:
     variance = data["F_x.variance.sigma0"]
     skewness = data["F_x.skewness.sigma0"]
     kurtosis = data["F_x.kurtosis.sigma0"]
+    mean_particle_force_y = data["particle_force_y.mean"].item()
+    mean_particle_torque_z = data["particle_torque_z.mean"].item()
 ```
 
 Completed version-2 output files can be reduced without rerunning the simulation
@@ -603,7 +654,10 @@ compare NumPy/Numba maps across periodic boundaries, invalid and constant data,
 memory layouts, and empty particle sets; verify thread restoration and optional
 dependency fallback; and compare all closure fields with uncached FFTs. Numba
 numerical tests skip when the optional dependency is absent. These tests
-establish numerical contracts; they do not replace a DNS comparison or a grid/
+also verify saved force/torque columns in native shared and replicated particle
+shards, pooled scalar moments against direct samples with uneven particle counts,
+zero/constant components, scalar serialization, and filter-independent output.
+These numerical contracts do not replace a DNS comparison or a grid/
 filter/quadrature convergence study. For complete equation-balance tests, also
 include the simulation's external forcing and enough snapshots to estimate time
 derivatives. Such forcing is not part of the nine closure definitions here.

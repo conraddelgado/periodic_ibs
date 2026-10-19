@@ -12,13 +12,15 @@ from time import perf_counter
 import numpy as np
 
 from .closures import closure_fields, reconstruct
-from .maps import ParticleMap
+from .maps import Moments, ParticleMap
 from .numerics import Grid
 from .reader import Reader
 
 VERSION = 3
 STATISTICS = ("mean", "variance", "skewness", "kurtosis")
 KEY_FORMAT = "{field}.{statistic}.sigma{filter_index}"
+PARTICLE_KEY_FORMAT = "{field}.{statistic}"
+PARTICLE_FIELDS = {f"particle_{kind}_{axis}": start + offset for kind, start in (("force", 1), ("torque", 4)) for offset, axis in enumerate("xyz")}
 
 
 def atomic_save(path, arrays):
@@ -80,7 +82,8 @@ def pack(moments, metadata):
     for (name, sigma_index), value in moments.items():
         for statistic in STATISTICS:
             array = np.where(value.weight > 0, value.mean, np.nan) if statistic == "mean" else getattr(value, statistic)
-            yield KEY_FORMAT.format(field=name, statistic=statistic, filter_index=sigma_index), array
+            key_format = PARTICLE_KEY_FORMAT if sigma_index is None else KEY_FORMAT
+            yield key_format.format(field=name, statistic=statistic, filter_index=sigma_index), array
 
 
 def process_snapshots(config, root, indices, progress_interval, worker_id=None):
@@ -103,6 +106,12 @@ def process_snapshots(config, root, indices, progress_interval, worker_id=None):
         report("reading particle state")
         fingerprint = reader.fingerprint(step)
         particles = reader.particles(step)
+        for name, column in PARTICLE_FIELDS.items():
+            key = (name, None)
+            if key not in moments:
+                moments[key] = Moments(())
+            for value in particles[:, column]:
+                moments[key].update(value)
         time = float(particles[0, 0])  # File timestamp is descriptive metadata only.
         state = reconstruct(grid, reader.fields(step), particles, config["physics"])
         report(f"fluid ready; time={time}, particles={len(particles)}, map backend={mapper.backend}")
@@ -187,6 +196,15 @@ def run(config_path, progress_interval=5.0, snapshot_workers=1):
     metadata["inputs"] = [item["inputs"] for item in records]
     metadata["particle_counts"] = [item["particle_count"] for item in records]
     metadata["snapshot_times"] = [item["time"] for item in records]
+    metadata["particle_statistics"] = {
+        "fields": list(PARTICLE_FIELDS),
+        "key_format": PARTICLE_KEY_FORMAT,
+        "shape": [],
+        "source": "ib_state",
+        "record_columns_one_based": {name: column + 1 for name, column in PARTICLE_FIELDS.items()},
+        "realizations": sum(metadata["particle_counts"]),
+        "weighting": "equal_particle_timestep_pairs",
+    }
     metadata["snapshot_seconds"] = [item["seconds"] for item in records]
     metadata["execution"] = {"snapshot_workers": workers, "fft_workers_per_worker": worker_config.get("fft_workers", 1), "map_backend": records[0]["map_backend"]}
     print(f"Writing final statistics: {output}", flush=True)
