@@ -322,6 +322,7 @@ class ReaderAndPipelineTests(unittest.TestCase):
             shared = np.concatenate([f.ravel(order="F") for f in fields]).astype("<f8")
             shared.tofile(root / "1.dat")
             part = particles(time=0.4)
+            part[0, 1:7] = [2, -3, 4, -5, 6, -7]
             part.astype("<f8").tofile(root / "ib1.dat")
             settings = {"format": "shared", "nvars": 5, "flow": "{step}.dat", "particles": "ib{step}.dat", "indices": {"rho": 1, "momentum": [2, 3, 4], "energy": 5}}
             reader = Reader(settings, grid, root)
@@ -371,7 +372,7 @@ class ReaderAndPipelineTests(unittest.TestCase):
                 self.assertEqual(metadata["output_mode"], "final_only")
                 self.assertTrue(np.all(np.isfinite(data["alpha.mean.sigma0"])))
                 assert_allclose(data["alpha.variance.sigma0"], 0)
-                self.assertEqual(len(data.files), 1 + 4 * len(cfg["fields"]))
+                self.assertEqual(len(data.files), 1 + 4 * len(cfg["fields"]) + 24)
             self.assertEqual([p.name for p in root.glob("*.npz")], ["stats.npz"])
             before = (root / "stats.npz").read_bytes()
             with self.assertRaises(FileExistsError):

@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 from numpy.testing import assert_allclose
 
-from .__main__ import run
+from .__main__ import PARTICLE_FIELDS, STATISTICS, run
 from .numerics import Grid
 from .test_volume_filter import config, conservative, particles
 
@@ -26,12 +26,17 @@ class ParallelSnapshotTests(unittest.TestCase):
             grid = Grid(**cfg["grid"])
             x = (np.arange(grid.shape[0]) + 0.5)[:, None, None] / grid.shape[0]
             centers = [(0.25, 0.25, 0.25), (0.75, 0.75, 0.75), (0.25, 0.75, 0.25)]
+            load_samples = []
             for step in cfg["snapshots"]:
                 rho = np.broadcast_to(1 + 0.05 * np.sin(2 * np.pi * x), grid.shape).copy()
                 velocity = [np.broadcast_to(0.2 * step + 0.05 * np.cos(2 * np.pi * x), grid.shape), np.zeros(grid.shape), np.zeros(grid.shape)]
                 fields = conservative(rho, velocity, np.full(grid.shape, 1.0 + step))
                 np.concatenate([field.ravel(order="F") for field in fields]).tofile(root / f"restart_data/{step}.dat")
-                np.concatenate([particles(center=center, radius=0.08, time=step / 10) for center in centers[:step]]).tofile(root / f"restart_data/ib_state_{step}.dat")
+                states = np.concatenate([particles(center=center, radius=0.08, time=step / 10) for center in centers[:step]])
+                base = np.array({1: [-3], 2: [1, 4], 3: [-2, 5, 12]}[step], dtype=float)
+                states[:, 1:7] = np.column_stack((base, 2 * base + 7, np.zeros_like(base), base**2, -3 * base + 1, np.full_like(base, 7)))
+                load_samples.extend(states[:, 1:7].copy())
+                states.tofile(root / f"restart_data/ib_state_{step}.dat")
             path = root / "config.json"
             path.write_text(json.dumps(cfg))
             run(path)
@@ -48,6 +53,22 @@ class ParallelSnapshotTests(unittest.TestCase):
                 self.assertEqual(metadata["completed"], 3)
                 self.assertEqual(metadata["particle_counts"], [1, 2, 3])
                 self.assertEqual(metadata["snapshot_times"], [0.1, 0.2, 0.3])
+                self.assertEqual(metadata["particle_statistics"]["realizations"], 6)
+                self.assertEqual(metadata["particle_statistics"]["shape"], [])
+                self.assertEqual(metadata["particle_statistics"]["record_columns_one_based"], {name: column + 1 for name, column in PARTICLE_FIELDS.items()})
+                expected_keys = {f"{name}.{statistic}" for name in PARTICLE_FIELDS for statistic in STATISTICS}
+                self.assertEqual({key for key in parallel.files if key.startswith("particle_")}, expected_keys)
+                samples = np.asarray(load_samples)
+                for name, column in PARTICLE_FIELDS.items():
+                    values = samples[:, column - 1]
+                    centered = values - values.mean()
+                    variance = np.mean(centered**2)
+                    expected = (values.mean(), variance, np.mean(centered**3) / variance**1.5 if variance > 0 else np.nan, np.mean(centered**4) / variance**2 if variance > 0 else np.nan)
+                    for statistic, value in zip(STATISTICS, expected):
+                        for output in (serial, parallel):
+                            actual = output[f"{name}.{statistic}"]
+                            self.assertEqual(actual.shape, ())
+                            assert_allclose(actual, value, rtol=1e-12, atol=1e-12, equal_nan=True, err_msg=f"{name}.{statistic}")
                 self.assertEqual(metadata["execution"]["snapshot_workers"], 2)
                 self.assertEqual(metadata["execution"]["fft_workers_per_worker"], 1)
                 self.assertIn(metadata["execution"]["map_backend"], ("numpy", "numba"))
