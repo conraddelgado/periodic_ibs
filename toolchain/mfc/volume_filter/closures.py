@@ -1,5 +1,7 @@
 """Instantaneous closures in Delgado's intrinsic volume-filtered convention."""
 
+from time import perf_counter
+
 import numpy as np
 from numpy.polynomial.legendre import leggauss
 
@@ -60,30 +62,48 @@ class Surface:
 class State:
     """Primitive reconstruction for a calorically perfect single gas."""
 
-    def __init__(self, fields, fluid, physics):
+    def __init__(self, fields, fluid, physics, report=None):
         self.fluid, self.physics = fluid, physics
         self.rho = next(fields)
-        if not np.all(np.isfinite(self.rho[fluid])) or np.any(self.rho[fluid] <= 0):
+        if not np.all(np.isfinite(self.rho), where=fluid) or np.any((self.rho <= 0) & fluid):
             raise ValueError("Nonpositive/nonfinite fluid density")
         self.rho[~fluid] = 1.0
         self.u = []
-        for _ in range(3):
+        for axis in "xyz":
             momentum = next(fields)
-            if not np.all(np.isfinite(momentum[fluid])):
+            if not np.all(np.isfinite(momentum), where=fluid):
                 raise ValueError("Nonfinite fluid momentum")
             momentum[~fluid] = 0
             momentum /= self.rho
             self.u.append(momentum)
+            if report is not None:
+                report(f"velocity {axis} reconstructed")
         energy = next(fields)
-        if not np.all(np.isfinite(energy[fluid])):
+        if not np.all(np.isfinite(energy), where=fluid):
             raise ValueError("Nonfinite fluid total energy")
         energy[~fluid] = 0
-        self.speed2 = sum(u**2 for u in self.u)
-        self.p = (physics["gamma"] - 1) * (energy - 0.5 * self.rho * self.speed2)
-        if not np.all(np.isfinite(self.p[fluid])) or np.any(self.p[fluid] <= 0):
+        if report is not None:
+            report("reconstructing pressure and temperature")
+        self.speed2 = np.empty_like(self.rho)
+        np.multiply(self.u[0], self.u[0], out=self.speed2)
+        for velocity in self.u[1:]:
+            self.speed2 += velocity * velocity
+        # Reuse the energy allocation for pressure; bound arithmetic scratch
+        # space to slabs instead of allocating several extra full-domain arrays.
+        for first in range(0, len(self.rho), 8):
+            slab = slice(first, first + 8)
+            energy[slab] -= 0.5 * self.rho[slab] * self.speed2[slab]
+            energy[slab] *= physics["gamma"] - 1
+        self.p = energy
+        if not np.all(np.isfinite(self.p), where=fluid) or np.any((self.p <= 0) & fluid):
             raise ValueError("Nonpositive/nonfinite fluid pressure; check EOS and conservative indices")
         self.p[~fluid] = 0
-        self.temperature = self.p / (self.rho * physics["gas_constant"])
+        self.temperature = np.empty_like(self.p)
+        for first in range(0, len(self.rho), 8):
+            slab = slice(first, first + 8)
+            self.temperature[slab] = self.p[slab] / (self.rho[slab] * physics["gas_constant"])
+        if report is not None:
+            report("fluid primitive state ready")
 
     def derivative(self, field, grid, axis):
         return fluid_derivative(field, self.fluid, axis, grid.dx[axis])
@@ -185,5 +205,11 @@ def closure_fields(grid, state, particles, sigma, config):
     yield from surface.sources(gaussian)
 
 
-def reconstruct(grid, fields, particles, physics):
-    return State(iter(fields), sphere_mask(grid, particles), physics)
+def reconstruct(grid, fields, particles, physics, report=None):
+    start = perf_counter()
+    if report is not None:
+        report("constructing periodic fluid/solid mask")
+    fluid = sphere_mask(grid, particles)
+    if report is not None:
+        report(f"fluid/solid mask constructed in {perf_counter() - start:.2f}s")
+    return State(iter(fields), fluid, physics, report)
