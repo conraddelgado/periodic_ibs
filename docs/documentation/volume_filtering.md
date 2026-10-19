@@ -47,34 +47,23 @@ input**; `gamma` is the physical heat-capacity ratio, not MFC's stored 1/(gamma-
 The grid in the JSON is an explicit assertion of the saved mesh: verify it
 against the case/grid files. No coordinates or precision are guessed from bytes.
 
-Progress is printed and flushed to the terminal or batch-job log automatically.
-The processor reports particle reading, fluid-state reconstruction, each filter's
-closure computation, and final output writing. Startup reports mask construction,
-each conservative-variable read/assembly, velocity reconstruction, and pressure/
-temperature reconstruction with elapsed snapshot times. Each full-domain field
-also reports its computation time before mapping. During map accumulation, each
-snapshot/filter/component reports its own processed-particle counter, for example:
+Progress is flushed to the terminal or batch-job log. Each selected
+snapshot/filter/component prints **one completion line**, for example:
 
 ```text
-Snapshot 1/3 step=1000 filter=1/2 sigma=0.025 F_x: particles 143/1000 (14.3%), elapsed 5.0s
+Snapshot 1/3 step=1000 filter=1/2 sigma=0.025 F_x: particles 95/95; compute 1.20s, map/stats 0.50s
 ```
 
-Each counter starts at zero and ends at the total particle count. Intermediate
-updates are limited to one every five seconds, checked after each particle
-finishes. Override the interval without changing the configuration:
-
-```bash
-PYTHONPATH=toolchain python -m mfc.volume_filter /path/to/case/closures.json --progress-interval 1
-```
-
-Use `--progress-interval 0` to print every particle. Counts reset for each field
-and filter because the code maps one full-domain closure component at a time.
-They count processed particles, including any with invalid map locations; valid
-statistical support is tracked internally when samples are accumulated.
-The percentage and elapsed time describe the current field's mapping pass, not
-the entire snapshot. Full-domain FFT/closure calculations occur between mapping
-passes and do not have a particle counter. Progress reporting does not change
-numerical results.
+There are no per-field start or intermediate progress lines. Unselected fields
+are silent. The count includes processed particles with invalid map locations;
+valid support is tracked internally. Compute time covers work since the preceding
+yielded field; shared closure work is attributed to whichever field follows it.
+Map/statistics time includes cumulative moment merging and, on the first Numba
+call, compilation or cache loading. Snapshot start, fluid-ready (including the
+actual map backend), filter start, snapshot completion, worker reduction, and
+final output messages remain. Detailed read/reconstruction timings are available
+through `benchmark_startup.py` below. The old `--progress-interval` option remains
+accepted for command compatibility but no longer changes this reporting.
 
 For multiple snapshots, independent processes can share one node:
 
@@ -84,7 +73,9 @@ PYTHONPATH=toolchain python -u -m mfc.volume_filter /path/to/case/closures.json 
 ```
 
 `fft_workers` is the total FFT-thread budget: each process receives
-`fft_workers // snapshot_workers` threads. It must be a positive integer at least
+`fft_workers // snapshot_workers` threads. The Numba mapper uses the same
+per-process budget during its mapping phase, capped by `NUMBA_NUM_THREADS` when
+set; FFT and mapping phases execute sequentially. The budget must be a positive integer at least
 as large as the effective process count, which is capped at the snapshot count.
 The default is one process, preserving the existing threaded execution. Use one
 scheduler task with enough allocated CPUs for that budget; launching multiple
@@ -241,8 +232,41 @@ For each configured saved index, the processor:
 closure calculation: unselected fields are still computed/yielded and skipped by
 the caller. Thus selecting only `F_x` reduces map work and statistics storage but
 does not eliminate the preceding closure computations. `fft_workers` controls
-FFTs, not particle mapping. Particle loops run sequentially within each snapshot
-worker; `--snapshot-workers` parallelizes distinct snapshots.
+both FFT and Numba mapping thread budgets. The NumPy map path processes particles
+sequentially; `--snapshot-workers` parallelizes distinct snapshots.
+
+Box maps use `map.backend: "auto"` by default: fused Numba mapping when Numba is
+installed, otherwise the existing NumPy path. Install the optional accelerator:
+
+```bash
+conda install -c conda-forge numba
+# Alternatively, with the repository installed through pip:
+pip install -e './toolchain[volume-filter]'
+```
+
+Set `"backend": "numpy"` inside `map` to force the reference path, or `"backend":
+"numba"` to require the accelerator and fail clearly if unavailable. Axisymmetric
+maps retain the NumPy path under `auto`; explicit `numba` currently requires a box.
+Output metadata records the actual backend in `execution.map_backend`.
+
+The fused kernel parallelizes over map locations. Each location loops through
+particles in their original order, interpolates eight corners, and immediately
+updates mean and central sums through order four in local scalars. It writes the
+accumulator once, avoiding per-particle map and moment-update temporary arrays.
+Only small 1D periodic stencils are precomputed. Double precision, invalid-support
+rules, and equal particle weights are preserved; fast-math is disabled. The first
+call compiles or loads a cached kernel. If the checkout is read-only, set
+`NUMBA_CACHE_DIR` to a writable job directory. No GPU packages are required.
+
+Closure derivatives reuse a maximum of two forward real-to-complex FFT spectra
+of immutable filtered mass, momentum, or pressure arrays. Diagonal stresses also
+reuse their repeated velocity gradient. The bounded cache is local to one
+snapshot/filter and cleared before interfacial-source filtering. It does not
+retain all velocity gradients or all filter widths. At 400^3, two complex128 half
+spectra occupy about 1.03 GB (decimal), in addition to FFT work buffers. This
+memory cost is per snapshot worker. Inverse transforms are still required.
+For all 59 fields with nonzero viscosity and conductivity, a measured closure pass
+used 47 forward and 66 inverse transforms, versus 72 of each before reuse.
 
 Box interpolation uses the Cartesian product structure: indices and fractions
 are calculated on three 1D axes, then eight corner contributions are broadcast
@@ -253,7 +277,8 @@ when its weight exceeds 1e-14; zero-weight invalid neighbors do not invalidate a
 sample. Unit-weight moment updates use the singleton central-moment recurrence;
 general weighted/grouped merges retain the existing formulas. Roundoff can differ
 from the generic implementation, but the mathematical interpolation/statistics
-are unchanged.
+are unchanged. This describes the NumPy reference path; Numba fuses interpolation
+and moment updates as described above.
 
 A reproducible benchmark compares the generic path against the optimized path:
 
@@ -267,6 +292,27 @@ three-repeat run measured median mapping times of 2.48 s (generic) and 0.31 s
 were 0.52 vs 0.08 s. The script checks counts and central sums against the generic
 path. These are local kernel timings, excluding input reads, full-domain closure
 FFTs, final output, and production DNS validation.
+
+Compare the current NumPy Cartesian mapper with the warmed fused Numba mapper:
+
+```bash
+PYTHONPATH=toolchain python misc/volume_filter/benchmark_acceleration.py --grid 400 --points 100 --particles 95 --workers 8 --repeats 3
+```
+
+This checks counts, central sums, and all four statistics, alternates measurement
+order, and reports first-call setup separately. It measures one scalar field's
+mapping only; it does not measure DNS I/O, closure FFTs, final output, or the
+complete production runtime.
+
+A local three-repeat run with a 400^3 source grid, 95 particles, 100^3 maps,
+and eight Numba threads measured median times of 8.75 s (NumPy) and 0.50 s
+(Numba), about 17.5x faster for one scalar field's mapping. A separate complete
+four-snapshot benchmark on a 96^3 grid, eight particles, 32^3 maps, all 59 fields,
+one filter, nonzero transport, and the same eight-CPU budget measured 8.87 s
+before these changes versus 5.42 s with Numba and FFT reuse (1.64x). That timing
+includes process startup and final output. All 236 final statistic arrays agreed
+within rtol=1e-8/atol=1e-10. These synthetic local timings do not establish the
+complete 400^3 production runtime or Delta filesystem performance.
 
 A 100^3 map contains one million locations, 1000 times a 10^3 map. Mapping cost
 still scales with map locations x particles x selected components x filter
@@ -502,7 +548,7 @@ also records `output_mode: "final_only"`, output format version 3, the key namin
 convention, retained statistic names, and the total completed snapshot count.
 `snapshot_seconds` records each snapshot's processing duration, excluding final
 worker reduction/output. `execution` records the effective process count and
-FFT threads per worker.
+FFT threads per worker, and the actual map backend.
 
 The ensemble calculation treats particle/timestep pairs as distinct realizations.
 It does not demonstrate physical independence: nearby particles and closely
@@ -538,7 +584,7 @@ weighting. Existing plotting scripts must switch to the new key names.
 Run the focused suite without compiling MFC:
 
 ```bash
-PYTHONPATH=toolchain python -m unittest mfc.volume_filter.test_volume_filter mfc.volume_filter.test_moments mfc.volume_filter.test_parallel -v
+PYTHONPATH=toolchain python -m unittest mfc.volume_filter.test_volume_filter mfc.volume_filter.test_moments mfc.volume_filter.test_parallel mfc.volume_filter.test_acceleration -v
 ```
 
 It exercises Fourier-mode attenuation, filtered momentum and energy identities,
@@ -552,7 +598,11 @@ particle counts, irregular file timestamps, step-only input, ignored legacy time
 final statistics serialization, compact-output key sets, legacy-file conversion,
 and failure cleanup. Spawned-worker tests compare all four final statistics with
 serial results across multiple filters and changing particle counts, check ordered
-provenance, and exercise worker failure without a final write. These tests
+provenance, and exercise worker failure without a final write. Accelerator tests
+compare NumPy/Numba maps across periodic boundaries, invalid and constant data,
+memory layouts, and empty particle sets; verify thread restoration and optional
+dependency fallback; and compare all closure fields with uncached FFTs. Numba
+numerical tests skip when the optional dependency is absent. These tests
 establish numerical contracts; they do not replace a DNS comparison or a grid/
 filter/quadrature convergence study. For complete equation-balance tests, also
 include the simulation's external forcing and enough snapshots to estimate time

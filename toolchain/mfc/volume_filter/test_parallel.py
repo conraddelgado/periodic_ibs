@@ -22,6 +22,7 @@ class ParallelSnapshotTests(unittest.TestCase):
             cfg.update(snapshots=[1, 2, 3], fft_workers=2, fields=[], sigmas=[0.1, 0.15])
             cfg["physics"] = dict(cfg["physics"], mu=0.01, conductivity=0.02)
             cfg["surface"] = dict(cfg["surface"], thermal_bc="reconstruct")
+            cfg["map"]["backend"] = "numpy"
             grid = Grid(**cfg["grid"])
             x = (np.arange(grid.shape[0]) + 0.5)[:, None, None] / grid.shape[0]
             centers = [(0.25, 0.25, 0.25), (0.75, 0.75, 0.75), (0.25, 0.75, 0.25)]
@@ -35,6 +36,7 @@ class ParallelSnapshotTests(unittest.TestCase):
             path.write_text(json.dumps(cfg))
             run(path)
             cfg["output"] = "parallel.npz"
+            cfg["map"]["backend"] = "auto"
             path.write_text(json.dumps(cfg))
             run(path, snapshot_workers=2)
             with np.load(root / "stats.npz") as serial, np.load(root / "parallel.npz") as parallel:
@@ -46,7 +48,9 @@ class ParallelSnapshotTests(unittest.TestCase):
                 self.assertEqual(metadata["completed"], 3)
                 self.assertEqual(metadata["particle_counts"], [1, 2, 3])
                 self.assertEqual(metadata["snapshot_times"], [0.1, 0.2, 0.3])
-                self.assertEqual(metadata["execution"], {"snapshot_workers": 2, "fft_workers_per_worker": 1})
+                self.assertEqual(metadata["execution"]["snapshot_workers"], 2)
+                self.assertEqual(metadata["execution"]["fft_workers_per_worker"], 1)
+                self.assertIn(metadata["execution"]["map_backend"], ("numpy", "numba"))
                 self.assertEqual([entry[0][0] for entry in metadata["inputs"]], [str(root / f"restart_data/{step}.dat") for step in (1, 2, 3)])
             self.assertEqual(len(list(root.glob("*.npz"))), 2)
             cfg.update(output="failed.npz", snapshots=[1, 99])

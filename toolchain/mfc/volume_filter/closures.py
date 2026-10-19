@@ -5,7 +5,7 @@ from time import perf_counter
 import numpy as np
 from numpy.polynomial.legendre import leggauss
 
-from .numerics import Gaussian, fluid_derivative, sphere_mask
+from .numerics import Gaussian, SpectralDerivatives, fluid_derivative, sphere_mask
 
 
 class Surface:
@@ -143,8 +143,10 @@ def closure_fields(grid, state, particles, sigma, config):
         yield f"alpha_{name}", np.where(valid, weighted, np.nan)
 
     # Derivatives of ratios use smooth filtered numerators, avoiding NaN stencils.
+    derivatives = SpectralDerivatives(gaussian)
+
     def velocity_gradient(i, j):
-        return (gaussian.derivative(momentum[i], j) - ubar[i] * gaussian.derivative(mass, j)) / denominator
+        return (derivatives.derivative(momentum[i], j) - ubar[i] * derivatives.derivative(mass, j)) / denominator
 
     raw_div = sum(state.derivative(state.u[i], grid, i) for i in range(3)) if mu else None
     resolved_div = sum(velocity_gradient(i, i) for i in range(3)) if mu else None
@@ -165,7 +167,9 @@ def closure_fields(grid, state, particles, sigma, config):
             del weighted
             if mu:
                 tau = mu * (state.derivative(state.u[i], grid, j) + state.derivative(state.u[j], grid, i))
-                resolved_tau = mu * (velocity_gradient(i, j) + velocity_gradient(j, i))
+                gradient = velocity_gradient(i, j)
+                resolved_tau = mu * (gradient + (gradient if i == j else velocity_gradient(j, i)))
+                del gradient
                 if i == j:
                     tau -= (2 * mu / 3) * raw_div
                     resolved_tau -= (2 * mu / 3) * resolved_div
@@ -196,12 +200,13 @@ def closure_fields(grid, state, particles, sigma, config):
             yield from intrinsic(f"R_tau_u_{axis}", np.zeros(grid.shape))
         if conductivity:
             heat_flux = -conductivity * state.derivative(state.temperature, grid, i)
-            grad_temperature = (gaussian.derivative(pbar_volume, i) / physics["gas_constant"] - temperature * gaussian.derivative(mass, i)) / denominator
+            grad_temperature = (derivatives.derivative(pbar_volume, i) / physics["gas_constant"] - temperature * derivatives.derivative(mass, i)) / denominator
             yield from intrinsic(f"R_q_{axis}", filt(heat_flux) + alpha * conductivity * grad_temperature)
             if config["surface"]["thermal_bc"] == "reconstruct":
                 surface.heat += surface.trace(heat_flux) * surface.normals[:, i]
         else:
             yield from intrinsic(f"R_q_{axis}", np.zeros(grid.shape))
+    derivatives.clear()
     yield from surface.sources(gaussian)
 
 
