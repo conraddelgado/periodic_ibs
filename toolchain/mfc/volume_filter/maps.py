@@ -42,12 +42,24 @@ class Moments:
         self.weight = total
         self.count += good
 
-    def merge(self, other):
+    def merge(self, other, *, workers=1):
         """Combine complete distributions, including their within-group scatter."""
         if self.mean.shape != other.mean.shape:
             raise ValueError("Cannot merge moments with different map shapes")
         if self is other:
             raise ValueError("Cannot merge a moment accumulator with itself")
+        # Tiny/scalar accumulators do not amortize parallel dispatch. Avoid
+        # reshape copies when callers supply noncontiguous diagnostic arrays.
+        names = ("count", "weight", "mean", "m2", "m3", "m4")
+        if self.mean.size >= 4096 and all(getattr(value, name).flags.c_contiguous for value in (self, other) for name in names):
+            try:
+                from .numba_kernels import merge_moments
+            except ModuleNotFoundError as error:
+                if error.name != "numba":
+                    raise
+            else:
+                merge_moments(self, other, workers=workers)
+                return
         self._combine(other.mean, other.weight, other.count, other.m2, other.m3, other.m4)
 
     def _combine(self, value, weight, count, m2, m3, m4):

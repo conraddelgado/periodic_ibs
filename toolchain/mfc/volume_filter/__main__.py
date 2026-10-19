@@ -132,7 +132,7 @@ def process_snapshots(config, root, indices, progress_interval, worker_id=None):
                 if key not in moments:
                     moments[key] = particle
                 else:
-                    moments[key].merge(particle)
+                    moments[key].merge(particle, workers=mapper.workers)
                 print(f"{filter_label} {name}: particles {len(particles)}/{len(particles)}; compute {compute_seconds:.2f}s, map/stats {perf_counter() - map_start:.2f}s", flush=True)
                 compute_start = perf_counter()
             if selected - seen:

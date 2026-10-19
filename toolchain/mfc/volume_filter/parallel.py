@@ -58,7 +58,7 @@ def run_workers(config, root, workers, interval):
                     if connection.recv_bytes_into(memoryview(array).cast("B")) != array.nbytes:
                         raise RuntimeError(f"Invalid moment transfer from snapshot worker {worker_id}")
                 if key in moments:
-                    moments[key].merge(value)
+                    moments[key].merge(value, workers=config.get("fft_workers", 1))
                 else:
                     moments[key] = value
             records.extend(local_records)

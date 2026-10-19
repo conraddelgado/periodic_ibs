@@ -110,8 +110,21 @@ def sphere_mask(grid, particles):
     return fluid
 
 
-def fluid_derivative(field, fluid, axis, dx):
+def fluid_derivative(field, fluid, axis, dx, *, workers=1):
     """Second-order centered or one-sided difference without crossing solid cells."""
+    if field.dtype == np.float64 and field.ndim == 3 and field.shape == fluid.shape and axis in (0, 1, 2):
+        try:
+            from .numba_kernels import fluid_difference
+        except ModuleNotFoundError as error:
+            if error.name != "numba":
+                raise
+        else:
+            return fluid_difference(field, fluid, axis, dx, workers=workers)
+    return _fluid_derivative_numpy(field, fluid, axis, dx)
+
+
+def _fluid_derivative_numpy(field, fluid, axis, dx):
+    """Array reference/fallback for the optional fused fluid stencil."""
     minus = np.roll(field, 1, axis)
     plus = np.roll(field, -1, axis)
     fm = np.roll(fluid, 1, axis)

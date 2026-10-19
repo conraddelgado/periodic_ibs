@@ -1,9 +1,9 @@
 """Fused box interpolation and particle moments; imported only when available."""
 
-import os
-
 import numpy as np
-from numba import config, get_num_threads, njit, prange, set_num_threads
+from numba import njit, prange
+
+from .numba_kernels import thread_budget
 
 
 @njit(cache=True, parallel=True, fastmath=False)
@@ -60,11 +60,6 @@ def map_box(grid, axis, field, states, result, *, workers):
     lo = np.floor(q).astype(np.int64)
     fraction = q - lo
     hi = (lo + 1) % np.asarray(grid.shape)[None, :, None]
-    previous_threads = get_num_threads()
-    threads = workers if workers > 0 else max(1, (os.cpu_count() or 1) + workers + 1)
-    set_num_threads(min(threads, config.NUMBA_NUM_THREADS))
-    try:
+    with thread_budget(workers):
         arrays = tuple(getattr(result, name).ravel() for name in ("count", "weight", "mean", "m2", "m3", "m4"))
         _box_moments(np.asarray(field, dtype=float), lo, hi, fraction, *arrays)
-    finally:
-        set_num_threads(previous_threads)

@@ -105,8 +105,8 @@ class State:
         if report is not None:
             report("fluid primitive state ready")
 
-    def derivative(self, field, grid, axis):
-        return fluid_derivative(field, self.fluid, axis, grid.dx[axis])
+    def derivative(self, field, grid, axis, *, workers=1):
+        return fluid_derivative(field, self.fluid, axis, grid.dx[axis], workers=workers)
 
 
 def closure_fields(grid, state, particles, sigma, config):
@@ -119,6 +119,9 @@ def closure_fields(grid, state, particles, sigma, config):
     mu, conductivity = physics["mu"], physics["conductivity"]
     gaussian = Gaussian(grid, sigma, config.get("fft_workers", 1))
     fluid = state.fluid
+
+    def raw_derivative(field, axis):
+        return state.derivative(field, grid, axis, workers=gaussian.workers)
 
     def filt(field):
         return gaussian(np.where(fluid, field, 0))
@@ -139,16 +142,25 @@ def closure_fields(grid, state, particles, sigma, config):
     yield "T_tilde", np.where(valid, temperature, np.nan)
 
     def intrinsic(name, weighted):
-        yield name, np.where(valid, weighted / np.where(valid, alpha, 1), np.nan)
-        yield f"alpha_{name}", np.where(valid, weighted, np.nan)
+        value = np.full_like(weighted, np.nan)
+        np.divide(weighted, alpha, out=value, where=valid)
+        yield name, value
+        del value
+        # Every caller passes a fresh weighted closure; retain that allocation
+        # for its companion instead of copying another full-domain field.
+        np.copyto(weighted, np.nan, where=~valid)
+        yield f"alpha_{name}", weighted
 
     # Derivatives of ratios use smooth filtered numerators, avoiding NaN stencils.
     derivatives = SpectralDerivatives(gaussian)
 
     def velocity_gradient(i, j):
-        return (derivatives.derivative(momentum[i], j) - ubar[i] * derivatives.derivative(mass, j)) / denominator
+        gradient = derivatives.derivative(momentum[i], j)
+        gradient -= ubar[i] * derivatives.derivative(mass, j)
+        gradient /= denominator
+        return gradient
 
-    raw_div = sum(state.derivative(state.u[i], grid, i) for i in range(3)) if mu else None
+    raw_div = sum(raw_derivative(state.u[i], i) for i in range(3)) if mu else None
     resolved_div = sum(velocity_gradient(i, i) for i in range(3)) if mu else None
     surface = Surface(grid, particles, fluid, config["surface"])
     surface.force = surface.trace(state.p)[:, None] * surface.normals
@@ -166,7 +178,9 @@ def closure_fields(grid, state, particles, sigma, config):
             yield from intrinsic(f"R_u_{suffix}", weighted)
             del weighted
             if mu:
-                tau = mu * (state.derivative(state.u[i], grid, j) + state.derivative(state.u[j], grid, i))
+                gradient = raw_derivative(state.u[i], j)
+                tau = mu * (gradient + (gradient if i == j else raw_derivative(state.u[j], i)))
+                del gradient
                 gradient = velocity_gradient(i, j)
                 resolved_tau = mu * (gradient + (gradient if i == j else velocity_gradient(j, i)))
                 del gradient
@@ -199,8 +213,11 @@ def closure_fields(grid, state, particles, sigma, config):
         else:
             yield from intrinsic(f"R_tau_u_{axis}", np.zeros(grid.shape))
         if conductivity:
-            heat_flux = -conductivity * state.derivative(state.temperature, grid, i)
-            grad_temperature = (derivatives.derivative(pbar_volume, i) / physics["gas_constant"] - temperature * derivatives.derivative(mass, i)) / denominator
+            heat_flux = -conductivity * raw_derivative(state.temperature, i)
+            grad_temperature = derivatives.derivative(pbar_volume, i)
+            grad_temperature /= physics["gas_constant"]
+            grad_temperature -= temperature * derivatives.derivative(mass, i)
+            grad_temperature /= denominator
             yield from intrinsic(f"R_q_{axis}", filt(heat_flux) + alpha * conductivity * grad_temperature)
             if config["surface"]["thermal_bc"] == "reconstruct":
                 surface.heat += surface.trace(heat_flux) * surface.normals[:, i]

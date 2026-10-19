@@ -23,6 +23,7 @@ class ParallelSnapshotTests(unittest.TestCase):
             cfg["physics"] = dict(cfg["physics"], mu=0.01, conductivity=0.02)
             cfg["surface"] = dict(cfg["surface"], thermal_bc="reconstruct")
             cfg["map"]["backend"] = "numpy"
+            cfg["map"]["points"] = 17  # Exercise compiled merging in workers and the parent.
             grid = Grid(**cfg["grid"])
             x = (np.arange(grid.shape[0]) + 0.5)[:, None, None] / grid.shape[0]
             centers = [(0.25, 0.25, 0.25), (0.75, 0.75, 0.75), (0.25, 0.75, 0.25)]

@@ -73,9 +73,9 @@ PYTHONPATH=toolchain python -u -m mfc.volume_filter /path/to/case/closures.json 
 ```
 
 `fft_workers` is the total FFT-thread budget: each process receives
-`fft_workers // snapshot_workers` threads. The Numba mapper uses the same
-per-process budget during its mapping phase, capped by `NUMBA_NUM_THREADS` when
-set; FFT and mapping phases execute sequentially. The budget must be a positive integer at least
+`fft_workers // snapshot_workers` threads. Numba mapping, fluid derivatives, and
+large-map moment merging use the same per-process budget, capped by
+`NUMBA_NUM_THREADS` when set; these phases execute sequentially. The budget must be a positive integer at least
 as large as the effective process count, which is capped at the snapshot count.
 The default is one process, preserving the existing threaded execution. Use one
 scheduler task with enough allocated CPUs for that budget; launching multiple
@@ -232,7 +232,7 @@ For each configured saved index, the processor:
 closure calculation: unselected fields are still computed/yielded and skipped by
 the caller. Thus selecting only `F_x` reduces map work and statistics storage but
 does not eliminate the preceding closure computations. `fft_workers` controls
-both FFT and Numba mapping thread budgets. The NumPy map path processes particles
+the FFT and Numba CPU thread budgets. The NumPy map path processes particles
 sequentially; `--snapshot-workers` parallelizes distinct snapshots.
 
 Box maps use `map.backend: "auto"` by default: fused Numba mapping when Numba is
@@ -248,6 +248,13 @@ Set `"backend": "numpy"` inside `map` to force the reference path, or `"backend"
 "numba"` to require the accelerator and fail clearly if unavailable. Axisymmetric
 maps retain the NumPy path under `auto`; explicit `numba` currently requires a box.
 Output metadata records the actual backend in `execution.map_backend`.
+
+Installing Numba also accelerates fluid-side differences and cumulative moment
+merges. This applies to both box and axisymmetric jobs, independently of
+`map.backend`, which controls interpolation only. Without Numba, these operations
+retain their NumPy implementations. Small accumulators (fewer than 4096 locations),
+including scalar force/torque statistics, use NumPy merging to avoid dispatch
+overhead. No additional configuration is required.
 
 The fused kernel parallelizes over map locations. Each location loops through
 particles in their original order, interpolates eight corners, and immediately
@@ -267,6 +274,24 @@ spectra occupy about 1.03 GB (decimal), in addition to FFT work buffers. This
 memory cost is per snapshot worker. Inverse transforms are still required.
 For all 59 fields with nonzero viscosity and conductivity, a measured closure pass
 used 47 forward and 66 inverse transforms, versus 72 of each before reuse.
+
+Fluid-side differences use a fused parallel stencil with direct periodic
+indexing. It preserves the centered, forward, then backward three-point stencil
+preference and the error for an unsupported fluid gap. Solid values are never
+read. Each call allocates one result field and small per-plane error flags,
+instead of rolling full flow/mask arrays and evaluating full-domain expressions
+for unused stencils. A viscous/conducting closure pass now evaluates 15 such
+derivatives instead of 18, reusing each diagonal derivative within its stress.
+
+Large contiguous maps merge counts, weights, means, and central sums through
+order four in one compiled pass per component. Incoming distributions are
+preserved, weights are validated before mutation, and locations are independent;
+there is no parallel reduction over particles or snapshots. The existing stable
+pairwise moment identities and invalid/empty-group rules are unchanged.
+Both kernels use float64 with fast-math disabled and restore the caller's Numba
+thread mask. Filtered velocity/temperature gradient arithmetic reuses its fresh
+derivative arrays, and intrinsic closures reuse their weighted allocation for
+the alpha-weighted output, reducing full-domain scratch copies.
 
 Box interpolation uses the Cartesian product structure: indices and fractions
 are calculated on three 1D axes, then eight corner contributions are broadcast
@@ -313,6 +338,33 @@ before these changes versus 5.42 s with Numba and FFT reuse (1.64x). That timing
 includes process startup and final output. All 236 final statistic arrays agreed
 within rtol=1e-8/atol=1e-10. These synthetic local timings do not establish the
 complete 400^3 production runtime or Delta filesystem performance.
+
+Benchmark the additional CPU kernels separately:
+
+```bash
+PYTHONPATH=toolchain python misc/volume_filter/benchmark_cpu.py --grid 400 --points 100 --workers 8 --repeats 3
+```
+
+This checks all three fluid-derivative directions across a periodic sphere with
+invalid solid values, and checks merged counts, central sums, and all four
+statistics. It alternates NumPy/Numba order and reports compilation/cache setup
+separately. A local eight-thread, three-repeat run measured 1.27--3.34 s per
+NumPy 400^3 derivative versus 0.109--0.144 s for the fused stencil (12--23x).
+A 100^3 central-moment merge took 0.205 s versus 0.00228 s (about 90x).
+These isolated timings exclude FFTs, interpolation, input/output, and the full
+statistics footprint. End-to-end gains depend on which phases dominate; they
+are not these kernel speedup factors. Memory pressure, filesystem cache state,
+thread count, and CPU allocation affect measurements.
+
+A separate three-repeat, eight-thread pipeline comparison against the preceding
+Numba-mapping/FFT-reuse implementation measured 16.30 s versus 14.60 s (1.12x).
+It used four synthetic 96^3 snapshots, 95 particles, 100^3 maps, one filter,
+nonzero transport, all 59 closures computed, and eight fields mapped/stored.
+Kernel setup was warmed before timing; snapshot reads, closure calculation,
+mapping, pooled statistics, and final output were included. All 56 final arrays
+(32 map statistics and 24 particle-load scalars) agreed within
+rtol=1e-8/atol=1e-10. This measures the production map dimensions on a smaller
+source grid, not the complete 400^3 DNS or Delta storage throughput.
 
 A 100^3 map contains one million locations, 1000 times a 10^3 map. Mapping cost
 still scales with map locations x particles x selected components x filter
@@ -652,7 +704,11 @@ serial results across multiple filters and changing particle counts, check order
 provenance, and exercise worker failure without a final write. Accelerator tests
 compare NumPy/Numba maps across periodic boundaries, invalid and constant data,
 memory layouts, and empty particle sets; verify thread restoration and optional
-dependency fallback; and compare all closure fields with uncached FFTs. Numba
+dependency fallback; compare fluid stencils on noncubic grids, periodic spheres,
+invalid solid data, multiple memory layouts, and unsupported gaps; compare fused
+weighted merges with uneven/empty groups and large mean offsets; check intrinsic
+masking and alpha-weighted companions; and compare all closure fields with
+uncached FFTs and NumPy fluid stencils. Numba
 numerical tests skip when the optional dependency is absent. These tests
 also verify saved force/torque columns in native shared and replicated particle
 shards, pooled scalar moments against direct samples with uneven particle counts,
