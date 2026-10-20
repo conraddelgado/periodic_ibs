@@ -690,7 +690,8 @@ with appropriate tolerances. A confidence interval for each map point is
 pointwise, not a simultaneous confidence band for the entire map.
 
 `observed_decorrelation_interval` is the first lag after which every measured
-correlation up to the lag limit stays below 0.05 in magnitude. It can be null,
+correlation up to the lag limit stays below 0.05 in magnitude, with at least half
+the lag window left to observe that tail. It can be null,
 and does not assert independence at unobserved lags. Oscillations and later peaks
 are included in this check. Changing the snapshot cadence changes the correlation
 factor and requires a new estimate; the forecast at the current spacing should

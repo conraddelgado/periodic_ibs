@@ -200,6 +200,21 @@ class SamplingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "max_lag"):
             analyze_histories(np.arange(64), {"X": history}, start_time=0, max_lag=40)
 
+    def test_zero_mean_requires_absolute_tolerance_and_oscillations_are_retained(self):
+        groups = [[-1.0], [1.0]] * 48
+        history = history_from_groups(groups)
+        report = analyze_histories(np.arange(96), {"zero": history}, start_time=0)
+        mean = report["fields"]["zero"]["probes"][0]["statistics"]["mean"]
+        self.assertIsNone(mean["target"])
+        absolute = analyze_histories(np.arange(96), {"zero": history}, start_time=0, absolute_error=0.1)
+        self.assertAlmostEqual(absolute["fields"]["zero"]["probes"][0]["statistics"]["mean"]["target"]["half_width_tolerance"], 0.1)
+        values = np.sin(2 * np.pi * np.arange(128) / 16)
+        periodic = history_from_groups([[value] for value in values])
+        result = analyze_histories(np.arange(128), {"periodic": periodic}, start_time=0, max_lag=28)
+        mean = result["fields"]["periodic"]["probes"][0]["statistics"]["mean"]
+        self.assertIsNone(mean["observed_decorrelation_interval"])
+        self.assertGreater(abs(mean["autocorrelation"][16]), 0.9)
+
     def test_report_uncertainty_targets_zero_means_and_json_cli(self):
         rng = np.random.default_rng(13)
         groups = [rng.normal(loc=2, size=2 + index % 3) for index in range(96)]

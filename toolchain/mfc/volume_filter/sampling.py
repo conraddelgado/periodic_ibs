@@ -172,10 +172,7 @@ def _block_sizes(snapshots):
 
 
 def _window_statistics(history):
-    return [
-        {"start_index": int(window[0]), "stop_index": int(window[-1]) + 1, "statistics": statistics(merge_rows(history, window))}
-        for window in np.array_split(np.arange(len(history["count"])), 4)
-    ]
+    return [{"start_index": int(window[0]), "stop_index": int(window[-1]) + 1, "statistics": statistics(merge_rows(history, window))} for window in np.array_split(np.arange(len(history["count"])), 4)]
 
 
 def _analyze_signal(values, estimate, spacing, max_lag, confidence, relative_error, absolute_error, block_errors):
@@ -207,7 +204,8 @@ def _analyze_signal(values, estimate, spacing, max_lag, confidence, relative_err
     if finite_errors and max(finite_errors) > 1.5 * min(finite_errors):
         result["warnings"].append("Block uncertainty estimates have no clear plateau; extend the record")
     decorrelation = None
-    for lag in range(1, len(rho)):
+    # Require a substantial observed tail, not a zero crossing at the boundary.
+    for lag in range(1, max_lag // 2 + 1):
         if np.max(np.abs(rho[lag:])) <= 0.05:
             decorrelation = float(lag * spacing)
             break
