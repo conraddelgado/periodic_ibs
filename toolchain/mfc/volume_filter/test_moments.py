@@ -14,7 +14,7 @@ from numpy.testing import assert_allclose, assert_array_equal
 from .__main__ import KEY_FORMAT, PARTICLE_FIELDS, STATISTICS, VERSION, atomic_save, pack, run
 from .compact import convert
 from .maps import Moments
-from .test_volume_filter import config, particles
+from .test_volume_filter import config, particles, synthetic_state
 
 
 def accumulate(samples, weights=None):
@@ -202,7 +202,7 @@ class MomentTests(unittest.TestCase):
                 progress_log = StringIO()
                 with (
                     redirect_stdout(progress_log),
-                    patch("mfc.volume_filter.__main__.reconstruct", return_value=None),
+                    patch("mfc.volume_filter.__main__.reconstruct", side_effect=lambda *args: synthetic_state()),
                     patch("mfc.volume_filter.__main__.closure_fields", side_effect=synthetic_fields),
                     patch("mfc.volume_filter.__main__.atomic_save", wraps=atomic_save) as save,
                 ):

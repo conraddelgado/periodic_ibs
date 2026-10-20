@@ -25,7 +25,7 @@ from .sampling import (
     mser_cutoff,
     regular_spacing,
 )
-from .test_volume_filter import config, particles
+from .test_volume_filter import config, particles, synthetic_state
 
 
 def history_from_groups(groups):
@@ -98,7 +98,7 @@ class DiagnosticsTests(unittest.TestCase):
 
             path = root / "config.json"
             path.write_text(json.dumps(cfg))
-            with patch("mfc.volume_filter.__main__.reconstruct", return_value=None), patch("mfc.volume_filter.__main__.closure_fields", side_effect=fields):
+            with patch("mfc.volume_filter.__main__.reconstruct", side_effect=lambda *args: synthetic_state()), patch("mfc.volume_filter.__main__.closure_fields", side_effect=fields):
                 run(path)
                 cfg["diagnostics"] = {"fields": ["F_x"], "map_indices": [[1, 1, 1], [2, 1, 1]]}
                 cfg["output"] = "history.npz"
