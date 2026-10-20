@@ -12,6 +12,7 @@ from time import perf_counter
 import numpy as np
 
 from .closures import closure_fields, reconstruct
+from .diagnostics import capture, history_arrays, validate_diagnostics
 from .maps import Moments, ParticleMap
 from .numerics import Grid
 from .reader import Reader
@@ -75,15 +76,19 @@ def validate(config):
     config["snapshots"] = steps
     config.pop("time_weighting", None)
     config.pop("save_snapshot_maps", None)
+    validate_diagnostics(config)
 
 
-def pack(moments, metadata):
+def pack(moments, metadata, records=None):
     yield "metadata", np.array(json.dumps(metadata, sort_keys=True))
     for (name, sigma_index), value in moments.items():
         for statistic in STATISTICS:
             array = np.where(value.weight > 0, value.mean, np.nan) if statistic == "mean" else getattr(value, statistic)
             key_format = PARTICLE_KEY_FORMAT if sigma_index is None else KEY_FORMAT
             yield key_format.format(field=name, statistic=statistic, filter_index=sigma_index), array
+
+    if records is not None:
+        yield from history_arrays(records)
 
 
 def process_snapshots(config, root, indices, progress_interval, worker_id=None):
@@ -93,6 +98,7 @@ def process_snapshots(config, root, indices, progress_interval, worker_id=None):
     mapper = ParticleMap(grid, config["map"], workers=config.get("fft_workers", 1))
     moments, records = {}, []
     selected = set(config.get("fields", []))
+    diagnostic_options = config.get("diagnostics")
     for index in indices:
         step = config["snapshots"][index]
         snapshot_start = perf_counter()
@@ -106,12 +112,20 @@ def process_snapshots(config, root, indices, progress_interval, worker_id=None):
         report("reading particle state")
         fingerprint = reader.fingerprint(step)
         particles = reader.particles(step)
+        history = {} if diagnostic_options is not None else None
+        if history is not None and (not np.all(np.isfinite(particles[:, 0])) or np.any(particles[:, 0] != particles[0, 0])):
+            raise ValueError("Diagnostic particle timestamps must be finite and identical within a snapshot")
         for name, column in PARTICLE_FIELDS.items():
             key = (name, None)
             if key not in moments:
                 moments[key] = Moments(())
+            snapshot_load = Moments(()) if history is not None and diagnostic_options["particle_loads"] else None
             for value in particles[:, column]:
                 moments[key].update(value)
+                if snapshot_load is not None:
+                    snapshot_load.update(value)
+            if snapshot_load is not None:
+                history[name] = capture(snapshot_load)
         time = float(particles[0, 0])  # File timestamp is descriptive metadata only.
         state = reconstruct(grid, reader.fields(step), particles, config["physics"])
         report(f"fluid ready; time={time}, particles={len(particles)}, map backend={mapper.backend}")
@@ -128,6 +142,8 @@ def process_snapshots(config, root, indices, progress_interval, worker_id=None):
                     continue
                 map_start = perf_counter()
                 particle = mapper.particles(field, particles)
+                if history is not None and name in diagnostic_options["fields"]:
+                    history[f"{name}.sigma{sigma_index}"] = capture(particle, diagnostic_options["map_indices"])
                 key = (name, sigma_index)
                 if key not in moments:
                     moments[key] = particle
@@ -137,10 +153,15 @@ def process_snapshots(config, root, indices, progress_interval, worker_id=None):
                 compute_start = perf_counter()
             if selected - seen:
                 raise ValueError(f"Unknown fields: {sorted(selected - seen)}")
+            if diagnostic_options is not None and set(diagnostic_options["fields"]) - seen:
+                raise ValueError(f"Unknown diagnostic fields: {sorted(set(diagnostic_options['fields']) - seen)}")
         del state
         if reader.fingerprint(step) != fingerprint:
             raise ValueError("Input changed while processing; only consume completed snapshots")
-        records.append({"index": index, "inputs": fingerprint, "particle_count": len(particles), "time": time, "seconds": perf_counter() - snapshot_start, "map_backend": mapper.backend})
+        record = {"index": index, "step": step, "inputs": fingerprint, "particle_count": len(particles), "time": time, "seconds": perf_counter() - snapshot_start, "map_backend": mapper.backend}
+        if history is not None:
+            record["diagnostics"] = history
+        records.append(record)
         report("complete; statistics retained in memory")
     return moments, records
 
@@ -207,8 +228,20 @@ def run(config_path, progress_interval=5.0, snapshot_workers=1):
     }
     metadata["snapshot_seconds"] = [item["seconds"] for item in records]
     metadata["execution"] = {"snapshot_workers": workers, "fft_workers_per_worker": worker_config.get("fft_workers", 1), "map_backend": records[0]["map_backend"]}
+    diagnostic_records = records if "diagnostics" in config else None
+    if diagnostic_records is not None:
+        metadata["diagnostics"] = {
+            "version": 1,
+            "prefix": "diagnostics.",
+            "shape": ["snapshot", "probe"],
+            "map_indices": config["diagnostics"]["map_indices"],
+            "moments": ["count", "mean", "m2", "m3", "m4"],
+            "central_sums": True,
+            "particle_load_probes": 1,
+            "weighting": "equal_particle_timestep_pairs",
+        }
     print(f"Writing final statistics: {output}", flush=True)
-    atomic_save(output, pack(moments, metadata))
+    atomic_save(output, pack(moments, metadata, diagnostic_records))
     print(f"Final output saved: {output}", flush=True)
     return output
 
