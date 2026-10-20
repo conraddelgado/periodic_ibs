@@ -209,7 +209,10 @@ def _analyze_signal(values, estimate, spacing, max_lag, confidence, relative_err
         if np.max(np.abs(rho[lag:])) <= 0.05:
             decorrelation = float(lag * spacing)
             break
-    tolerance = absolute_error if absolute_error is not None else relative_error * abs(estimate)
+    numerically_zero = abs(estimate) <= 32 * np.finfo(float).eps * np.std(values, ddof=1)
+    tolerance = absolute_error if absolute_error is not None else (0.0 if numerically_zero else relative_error * abs(estimate))
+    if absolute_error is None and abs(estimate) < half_width:
+        result["warnings"].append("Statistic is poorly separated from zero; consider a physically chosen absolute tolerance")
     target = None
     if tolerance > 0:
         required = int(np.ceil(snapshots * (half_width / tolerance) ** 2))
