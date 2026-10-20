@@ -19,7 +19,7 @@ non-spherical bodies require additional reconstruction logic and are not covered
 Execution is **single-node**, with optional independent snapshot processes
 (`--snapshot-workers`) and threaded SciPy FFTs (`fft_workers`). Each worker's global
 snapshot, work arrays, and accumulated moments must fit in RAM. Reading simulation MPI shards
-does not make this a distributed FFT implementation. Memory is independent of the
+does not make this a distributed FFT implementation. With diagnostics disabled, memory is independent of the
 number of snapshots; it still grows with grid size, surface quadrature points,
 map size, and the number of retained statistics. A double scalar field on a
 512 x 256 x 256 grid is 256 MiB; budget several GiB beyond the input state for
@@ -508,8 +508,8 @@ merging only particle-average maps would lose within-snapshot scatter. These
 pairwise formulas follow
 [Pebay, SAND2008-6212](https://doi.org/10.2172/1028931). Accumulators use float64,
 with int64 valid-realization counts, and memory remains independent of the number
-of snapshots. Counts, weights, and central sums are needed internally for stable
-accumulation, but are not written to disk. Final output entries are streamed
+of snapshots when diagnostics are disabled. Counts, weights, and central sums are needed internally for stable
+accumulation; selected diagnostic counts and central sums can optionally be retained. Final output entries are streamed
 instead of duplicating all derived arrays in memory.
 
 The version-3 NPZ uses **field, statistic, filter index** ordering:
@@ -554,8 +554,153 @@ FFT threads per worker, and the actual map backend.
 
 The ensemble calculation treats particle/timestep pairs as distinct realizations.
 It does not demonstrate physical independence: nearby particles and closely
-spaced times may be correlated. No effective sample size, confidence intervals,
-or autocorrelation estimates are inferred.
+spaced times may be correlated. The primary ensemble alone infers no effective sample size, confidence intervals,
+or autocorrelation estimates; optional compact histories support the analysis below.
+
+## Compact histories and sampling analysis
+
+The optional `diagnostics` object retains ordered particle-ensemble accumulators
+at a small set of **zero-based map indices**. Existing statistics and their
+normalization are unchanged. Without this object, no history arrays are stored.
+
+For a 21-by-21-by-21 box map, for example:
+
+```json
+"diagnostics": {
+  "fields": ["F_x", "R_u_xx", "R_mu_xx"],
+  "map_indices": [[5, 10, 10], [10, 10, 10], [15, 10, 10]],
+  "particle_loads": true
+}
+```
+
+Diagnostic fields must also be included in `fields` when the latter explicitly
+restricts the mapped components. Indices address the existing map arrays; they
+are not physical coordinates or DNS-grid indices. Axisymmetric maps use two
+indices, axial then radial, and retain moments of each particle's ring average.
+Full map interpolation is still performed; this option reduces retained history
+storage, not closure or map computation. Each configured filter is recorded.
+
+Omit `fields` and `map_indices` to retain only the six particle-load histories.
+Set `particle_loads: false` to omit those histories. The force/torque source and
+stage-timing qualifications below also apply to diagnostics.
+
+The same final NPZ additionally contains:
+
+| Key | Shape and meaning |
+|---|---|
+| `diagnostics.times` | (snapshot,), physical times from particle records |
+| `diagnostics.steps` | (snapshot,), configured saved file indices |
+| `diagnostics.F_x.sigma0.count` | (snapshot, probe), valid particle counts |
+| `diagnostics.F_x.sigma0.mean` | (snapshot, probe), particle mean before time pooling |
+| `diagnostics.F_x.sigma0.m2`, `.m3`, `.m4` | Unnormalized central sums within each snapshot |
+| `diagnostics.particle_force_x.mean` | (snapshot, 1), particle-average saved force |
+
+Every history has count, mean, m2, m3, and m4 arrays. The count remains int64;
+central sums and means remain float64. Empty support has zero count and must not
+be interpreted as a zero-valued observation. Main population variance is not the
+variance of the snapshot means. Counts and sums preserve the within-snapshot
+particle scatter needed to reconstruct the original ensemble.
+
+Histories are captured before cumulative merging, transferred with the compact
+worker records, and restored to configured snapshot order in the parent. Workers
+still write no files. They are published with the final statistics in the same
+atomic write; histories are not checkpoints. The primary format remains version
+3, with an optional version-1 diagnostics description in metadata. History memory
+and output grow with snapshots times probes times selected fields and filters,
+rather than snapshots times the full map size.
+
+All particles in a diagnostic snapshot must have identical finite timestamps.
+Diagnostic snapshots must be supplied in strictly increasing physical-time order.
+The extractor retains irregular time spacing, but the analysis below rejects
+irregular spacing instead of assigning an artificial interval or bridging gaps.
+
+### Analyze stationarity and sampling uncertainty
+
+First produce a pilot with sufficiently frequent, synchronized, full-resolution
+flow and particle outputs. The closure computation remains offline. Include at
+least 32 snapshots in the retained production interval; that minimum is a software
+guard, not a convergence criterion. In practice extend the pilot to cover many
+slow correlation times and verify the estimates as the record grows.
+
+```bash
+PYTHONPATH=toolchain python -m mfc.volume_filter closures.json
+PYTHONPATH=toolchain python -m mfc.volume_filter.sampling closure_statistics.npz sampling.json \
+  --field F_x.sigma0 --field R_u_xx.sigma0 --start-time 0.01 --relative-error 0.05
+```
+
+The output JSON is new and existing files are never overwritten. `--field` can
+be repeated and selects exact history identifiers, including, for example,
+`particle_force_x`. Omit it to analyze all recorded histories. All calculations
+use physical time, never the numerical difference between saved file indices.
+Inspect `metadata["diagnostics"]["map_indices"]` in the input to locate probes.
+
+If `--start-time` is omitted, a constrained MSER-5 screen suggests a common
+starting snapshot from all selected count and estimator-influence histories. It
+discards at most half the record and always retains at least 32 snapshots.
+`suggested_start_time` and individual `transient_candidates` are reported even
+when an explicit start is supplied. This is a heuristic transient screen, **not
+a declaration that the flow is stationary**. Compare the four consecutive
+`windows`, their means and variances, later starting times, and longer records.
+Controller targets alone do not establish stationarity of the closure field.
+
+For every field/probe, the report contains:
+
+- Pooled mean, population variance, skewness, and Pearson kurtosis.
+- An autocorrelation and integral time for each statistic's estimator influence.
+- Effective sample size, standard error, and an approximate confidence interval.
+- Complete-distribution block-jackknife estimates over several block lengths.
+- Estimated snapshots and duration needed at the **current spacing** for the
+  requested confidence half-width, and estimated additional duration.
+- Warnings for constant/undefined signals, appreciable correlation at the lag
+  boundary, or sensitivity to lag-window length and block size.
+
+The mean influence at time t is proportional to
+`n_t * (mean_t - pooled_mean) / average(n_t)`. Thus varying particle counts and
+empty-support snapshots remain on the original regular time axis. Skewness and
+kurtosis use the corresponding delta-method influences, including the dependence
+on the estimated mean and variance. No particle-independence assumption is made.
+Deleting a time block removes all its particles together and recomputes the full
+pooled statistic from central sums, including within-snapshot scatter. At least
+eight complete blocks are required; trailing snapshots that do not form a full
+block are excluded only from that block comparison and its used count is reported.
+
+Autocorrelations use FFTs and the N-k covariance normalization. The correlation
+factor uses a Bartlett lag window and finite-record weighting, with default
+maximum lag min(N/4, 4096); override using `--max-lag`. The reported integral
+time is half the physical sample interval times that factor. It is a discrete,
+windowed estimate, and coarse sampling cannot recover unresolved fast decay.
+For uncertainty only, the factor is conservatively bounded below by one. The
+reported standard error takes the maximum of that HAC estimate and the available
+block-jackknife estimates. Inspect the block-size dependence for a plateau;
+eight blocks or a finite error bar do not establish a reliable uncertainty.
+
+Confidence intervals default to 95 percent and use an asymptotic normal
+approximation; change with `--confidence`. Forecasts assume stationary mixing
+data, finite relevant moments, and the observed variance/correlation behavior.
+They are provisional, especially when a warning is present. Constant sampled
+influences have unresolved dependence and no sample-count forecast. Undefined
+statistics and other nonfinite results are JSON null, not nonstandard NaN tokens.
+
+`--relative-error 0.05` requests a half-width of five percent of the magnitude
+of each statistic. A statistic near zero needs a physically chosen absolute
+scale: `--absolute-error` overrides the relative tolerance for all selected
+statistics, numerically in each statistic's own units. Select fields and inspect
+statistics with compatible tolerances, or call `analyze_histories` separately
+with appropriate tolerances. A confidence interval for each map point is
+pointwise, not a simultaneous confidence band for the entire map.
+
+`observed_decorrelation_interval` is the first lag after which every measured
+correlation up to the lag limit stays below 0.05 in magnitude, with at least half
+the lag window left to observe that tail. It can be null,
+and does not assert independence at unobserved lags. Oscillations and later peaks
+are included in this check. Changing the snapshot cadence changes the correlation
+factor and requires a new estimate; the forecast at the current spacing should
+not be reused unchanged for a different spacing.
+
+Relevant methods: [Oliver et al., Physics of Fluids 26, 035101 (2014)](https://doi.org/10.1063/1.4866813)
+for correlated DNS sampling uncertainty, and
+[Bergmann et al., Journal of Turbomachinery 144, 031005 (2022)](https://doi.org/10.1115/1.4052402)
+for transient screening and statistical convergence in turbulent simulations.
 
 ### Scalar particle forces and torques
 

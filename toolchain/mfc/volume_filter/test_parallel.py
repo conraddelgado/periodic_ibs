@@ -20,6 +20,7 @@ class ParallelSnapshotTests(unittest.TestCase):
             (root / "restart_data").mkdir()
             cfg = config()
             cfg.update(snapshots=[1, 2, 3], fft_workers=2, fields=[], sigmas=[0.1, 0.15])
+            cfg["diagnostics"] = {"fields": ["F_x", "R_u_xx"], "map_indices": [[0, 0, 0], [1, 1, 1]]}
             cfg["physics"] = dict(cfg["physics"], mu=0.01, conductivity=0.02)
             cfg["surface"] = dict(cfg["surface"], thermal_bc="reconstruct")
             cfg["map"]["backend"] = "numpy"
@@ -53,6 +54,9 @@ class ParallelSnapshotTests(unittest.TestCase):
                 self.assertEqual(metadata["completed"], 3)
                 self.assertEqual(metadata["particle_counts"], [1, 2, 3])
                 self.assertEqual(metadata["snapshot_times"], [0.1, 0.2, 0.3])
+                assert_allclose(parallel["diagnostics.times"], [0.1, 0.2, 0.3])
+                assert_allclose(parallel["diagnostics.particle_force_x.count"][:, 0], [1, 2, 3])
+                self.assertEqual(parallel["diagnostics.F_x.sigma0.mean"].shape, (3, 2))
                 self.assertEqual(metadata["particle_statistics"]["realizations"], 6)
                 self.assertEqual(metadata["particle_statistics"]["shape"], [])
                 self.assertEqual(metadata["particle_statistics"]["record_columns_one_based"], {name: column + 1 for name, column in PARTICLE_FIELDS.items()})
