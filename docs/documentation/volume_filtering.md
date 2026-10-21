@@ -377,7 +377,12 @@ The fluid indicator is reconstructed from periodic spheres at cell centers.
 Solid/ghost values are excluded from all fluid integrals, including derivatives.
 Fluid gradients use second-order centered differences where both neighbors are
 fluid and second-order one-sided differences otherwise. Stencils do not cross
-solid cells. A gap without a contiguous three-fluid-cell stencil raises an error.
+solid cells. A two-fluid-cell run uses a first-order difference. If neither face
+neighbor is fluid, a local affine least-squares fit uses the fluid cell centers
+in a five-by-five-by-five neighborhood, with periodic distances measured in cell
+units and weights 1/(1 + distance squared). Its reusable geometry excludes every
+solid/ghost value. These fallbacks allow narrow gaps and colliding particles to
+contribute to the same particle/timestep ensemble instead of aborting the run.
 Derivatives of filtered quantities use spectral derivatives and the quotient rule
 for Favre ratios; the odd derivative's Nyquist coefficient is zero.
 
@@ -385,9 +390,52 @@ Sphere surfaces use Gauss-Legendre quadrature in cos(theta) and uniform azimuth
 (`polar_points` by `2*polar_points`). Pressure, stress, and (when requested) heat
 flux at the surface are extrapolated as 2*f(d)-f(2d), with trilinear fluid-only
 samples along the outward normal and d = `offset_cells` * max(dx). Both sample
-stencils must be fluid. Neighbor interference causes an error instead of quietly
-using solid data. Changing offsets is not a substitute for a grid convergence
-study; close gaps may need a more sophisticated interface reconstruction.
+stencils must be fluid. If a neighbor obstructs that pair, the offset is halved
+up to four times, retaining the first pair with complete fluid support. If no
+pair is supported, the surface value uses the same local fluid-only affine fit.
+Only a fit with no fluid samples expands its search neighborhood until support
+is found. Nonfinite values in contributing fluid cells still fail; solid values
+are never used. Fitted values are finite before deposition and FFT filtering.
+
+Collisions represented by overlapping spheres use the exposed surface of their
+union. Quadrature points buried inside another sphere are omitted without
+renormalizing the remaining area; coincident surfaces are counted once. Saved
+particle force/torque statistics retain their original values, which can include
+contact loads. Those contact loads are not added to reconstructed fluid traction.
+
+### Reconstruction limits and support records
+
+An affine fit is exact for constants and for affine fields when its geometry has
+full rank. Rank-deficient fits use the minimum-norm gradient about the weighted
+sample centroid: undetermined gradient components are zero. These are explicit
+local completion assumptions, not recovered measurements. A fit can use fluid
+cells around both sides of a contact; it does not establish a connected fluid
+path between its samples. Neither this fit nor the first-order fallback resolves
+subgrid lubrication or contact-film stresses. Finite statistics describe the
+chosen reconstruction and must be checked under grid refinement.
+
+Every final NPZ records the policy and ordered per-snapshot support counts under
+`metadata["reconstruction"]`. This is additive metadata; the four primary
+statistics, field keys, equal realization weights, and optional histories are
+unchanged. Counts describe geometry once per snapshot, rather than summing
+repeated derivative calls or filter widths:
+
+| Per-snapshot entry | Meaning |
+|---|---|
+| `derivatives.x/y/z.first_order_cells` | Fluid cells using a two-point difference |
+| `derivatives.x/y/z.affine_fit_cells` | Fluid cells using a local fitted derivative |
+| `derivatives.x/y/z.rank_deficient_fits` | Derivative fits lacking a full 3D affine basis |
+| `surface.reduced_offset_points` | Exposed quadrature points using a shorter normal pair |
+| `surface.affine_fit_points` | Exposed quadrature points using a local fitted trace |
+| `surface.rank_deficient_fits` | Surface fits lacking a full 3D affine basis |
+| `surface.expanded_search_points` | Surface fits needing support beyond the initial neighborhood |
+| `surface.buried_points` | Omitted quadrature points inside overlapping spheres |
+
+Derivative entries are absent when no raw derivative is needed, for example when
+both transport coefficients are zero. One snapshot completion message also
+reports limited reconstruction when any fallback or buried surface is present.
+Changing offsets or accepting a finite fit is not a substitute for a grid
+convergence study.
 
 Weighted surface sources are deposited conservatively with cloud-in-cell weights,
 divided by cell volume, and then Gaussian-filtered. This introduces a discrete
@@ -780,7 +828,7 @@ weighting. Existing plotting scripts must switch to the new key names.
 Run the focused suite without compiling MFC:
 
 ```bash
-PYTHONPATH=toolchain python -m unittest mfc.volume_filter.test_volume_filter mfc.volume_filter.test_moments mfc.volume_filter.test_parallel mfc.volume_filter.test_acceleration -v
+PYTHONPATH=toolchain python -m unittest mfc.volume_filter.test_volume_filter mfc.volume_filter.test_moments mfc.volume_filter.test_parallel mfc.volume_filter.test_acceleration mfc.volume_filter.test_diagnostics mfc.volume_filter.test_collisions -v
 ```
 
 It exercises Fourier-mode attenuation, filtered momentum and energy identities,
@@ -802,6 +850,13 @@ numerical tests skip when the optional dependency is absent. These tests
 also verify saved force/torque columns in native shared and replicated particle
 shards, pooled scalar moments against direct samples with uneven particle counts,
 zero/constant components, scalar serialization, and filter-independent output.
+Collision tests cover two-cell and isolated-cell gaps, affine and constant
+reconstruction, rank-deficient and expanded fits, periodic wrapping, invalid
+solid values, and the exposed boundary of overlapping or contained spheres.
+Moving near-contact/contact/overlap snapshots exercise all closure fields with
+nonzero viscosity and conductivity. Their saved maps and histories agree with
+direct particle samples and spawned workers, including Numba mapping when
+available.
 These numerical contracts do not replace a DNS comparison or a grid/
 filter/quadrature convergence study. For complete equation-balance tests, also
 include the simulation's external forcing and enough snapshots to estimate time

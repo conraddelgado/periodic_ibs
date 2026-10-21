@@ -155,13 +155,28 @@ def process_snapshots(config, root, indices, progress_interval, worker_id=None):
                 raise ValueError(f"Unknown fields: {sorted(selected - seen)}")
             if diagnostic_options is not None and set(diagnostic_options["fields"]) - seen:
                 raise ValueError(f"Unknown diagnostic fields: {sorted(set(diagnostic_options['fields']) - seen)}")
+        reconstruction = state.reconstruction_metadata()
         del state
         if reader.fingerprint(step) != fingerprint:
             raise ValueError("Input changed while processing; only consume completed snapshots")
-        record = {"index": index, "step": step, "inputs": fingerprint, "particle_count": len(particles), "time": time, "seconds": perf_counter() - snapshot_start, "map_backend": mapper.backend}
+        record = {
+            "index": index,
+            "step": step,
+            "inputs": fingerprint,
+            "particle_count": len(particles),
+            "time": time,
+            "seconds": perf_counter() - snapshot_start,
+            "map_backend": mapper.backend,
+            "reconstruction": reconstruction,
+        }
         if history is not None:
             record["diagnostics"] = history
         records.append(record)
+        derivatives = reconstruction["derivatives"].values()
+        gap_cells = sum(info["first_order_cells"] + info["affine_fit_cells"] for info in derivatives)
+        surface = reconstruction["surface"]
+        if gap_cells or any(surface[name] for name in ("buried_points", "reduced_offset_points", "affine_fit_points")):
+            report(f"limited reconstruction: {gap_cells} cell/axis derivatives; surface {surface}")
         report("complete; statistics retained in memory")
     return moments, records
 
@@ -227,6 +242,14 @@ def run(config_path, progress_interval=5.0, snapshot_workers=1):
         "weighting": "equal_particle_timestep_pairs",
     }
     metadata["snapshot_seconds"] = [item["seconds"] for item in records]
+    metadata["reconstruction"] = {
+        "derivatives": "second_order_then_first_order_then_local_affine",
+        "surface": "normal_extrapolation_then_reduced_offset_then_local_affine",
+        "affine_radius_cells": 2,
+        "rank_deficiency": "minimum_norm_gradient; unresolved components are zero",
+        "overlaps": "exclude buried sphere quadrature without area renormalization",
+        "snapshots": [item["reconstruction"] for item in records],
+    }
     metadata["execution"] = {"snapshot_workers": workers, "fft_workers_per_worker": worker_config.get("fft_workers", 1), "map_backend": records[0]["map_backend"]}
     diagnostic_records = records if "diagnostics" in config else None
     if diagnostic_records is not None:

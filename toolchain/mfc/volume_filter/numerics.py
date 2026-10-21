@@ -110,8 +110,84 @@ def sphere_mask(grid, particles):
     return fluid
 
 
-def fluid_derivative(field, fluid, axis, dx):
-    """Second-order centered or one-sided difference without crossing solid cells."""
+class LocalFluidFit:
+    """Sparse affine fits using only nearby fluid cells, in cell-index units.
+
+    Centering the fit at its weighted centroid preserves constants even when
+    the samples cannot determine all three gradient components. The minimum
+    norm fit sets undetermined gradient components to zero; it does not resolve
+    subcell gaps. Geometry and weights are reusable across fields.
+    """
+
+    def __init__(self, fluid, coordinates, derivative=None):
+        if not np.any(fluid):
+            raise ValueError("Local reconstruction requires at least one fluid cell")
+        coordinates = np.asarray(coordinates, dtype=float).reshape(-1, 3) % fluid.shape
+        self.derivative = derivative
+        self.indices, self.weights = [], []
+        self.rank_deficient = self.expanded = 0
+        shape = np.asarray(fluid.shape)
+        pending = np.arange(len(coordinates))
+        radius = 2
+        while len(pending):
+            offsets = np.array(list(product(*(range(-min(radius, n // 2), min(radius, (n - 1) // 2) + 1) for n in shape))))
+            unresolved = []
+            chunk = max(1, 32768 // len(offsets))
+            for first in range(0, len(pending), chunk):
+                rows = pending[first : first + chunk]
+                points = coordinates[rows]
+                index = (np.floor(points + 0.5).astype(np.int64)[:, None, :] + offsets) % shape
+                delta = (index - points[:, None, :] + shape / 2) % shape - shape / 2
+                good = fluid[tuple(np.moveaxis(index, -1, 0))]
+                supported = np.any(good, axis=1)
+                unresolved.extend(rows[~supported])
+                if not np.any(supported):
+                    continue
+                rows, index, delta, good = rows[supported], index[supported], delta[supported], good[supported]
+                weight = good / (1 + np.sum(delta**2, axis=-1))
+                centroid = np.sum(weight[..., None] * delta, axis=1) / weight.sum(axis=1)[:, None]
+                design = np.concatenate((np.ones((*weight.shape, 1)), delta - centroid[:, None, :]), axis=-1)
+                root = np.sqrt(weight)
+                left, singular, right = np.linalg.svd(design * root[..., None], full_matrices=False)
+                retained = singular > 1e-12 * singular[:, :1]
+                inverse = np.divide(1, singular, out=np.zeros_like(singular), where=retained)
+                coefficients = ((right.swapaxes(1, 2) * inverse[:, None, :]) @ left.swapaxes(1, 2)) * root[:, None, :]
+                if derivative is None:
+                    weights = coefficients[:, 0] - np.einsum("ni,nij->nj", centroid, coefficients[:, 1:])
+                else:
+                    weights = coefficients[:, derivative + 1]
+                self.rank_deficient += int(np.count_nonzero(retained.sum(axis=1) < 4))
+                self.expanded += len(rows) if radius > 2 else 0
+                flat = np.ravel_multi_index(tuple(np.moveaxis(index, -1, 0)), shape)
+                anchor = flat[np.arange(len(rows)), good.argmax(axis=1)]
+                self.indices.append((rows, flat, anchor))
+                self.weights.append(weights)
+            pending = np.asarray(unresolved, dtype=np.int64)
+            radius *= 2
+        self.size = len(coordinates)
+
+    def __call__(self, field):
+        result = np.empty(self.size)
+        flat = np.asarray(field).ravel()
+        for (rows, index, anchor), weights in zip(self.indices, self.weights):
+            values, reference = flat[index], flat[anchor]
+            active = weights != 0
+            if np.any(active & ~np.isfinite(values)) or not np.all(np.isfinite(reference)):
+                raise ValueError("Nonfinite fluid values in local reconstruction")
+            difference = np.where(active, values, reference[:, None]) - reference[:, None]
+            result[rows] = np.sum(weights * difference, axis=1)
+            if self.derivative is None:
+                result[rows] += reference
+        return result
+
+
+def fluid_derivative(field, fluid, axis, dx, fallbacks=None):
+    """Prefer three-point differences; fit underresolved gaps without solid data.
+
+    Two-cell runs use first-order differences. An isolated cell along this
+    axis uses a local fluid-only affine fit. Optional per-state fallbacks cache
+    that geometry and retain support counts, once per axis rather than field.
+    """
     minus = np.roll(field, 1, axis)
     plus = np.roll(field, -1, axis)
     fm = np.roll(fluid, 1, axis)
@@ -119,12 +195,29 @@ def fluid_derivative(field, fluid, axis, dx):
     centered = fluid & fm & fp
     forward = fluid & ~centered & fp & np.roll(fluid, -2, axis)
     backward = fluid & ~centered & ~forward & fm & np.roll(fluid, 2, axis)
-    if np.any(fluid & ~(centered | forward | backward)):
-        raise ValueError("Fluid gap has no three-point derivative stencil; refine the grid or supply a different reconstruction")
+    missing = fluid & ~(centered | forward | backward)
+    first_forward = missing & fp
+    first_backward = missing & ~first_forward & fm
+    isolated = missing & ~(first_forward | first_backward)
     result = np.zeros_like(field)
-    result[centered] = ((plus - minus) / (2 * dx))[centered]
-    result[forward] = ((-3 * field + 4 * plus - np.roll(field, -2, axis)) / (2 * dx))[forward]
-    result[backward] = ((3 * field - 4 * minus + np.roll(field, 2, axis)) / (2 * dx))[backward]
+    result[centered] = (plus[centered] - minus[centered]) / (2 * dx)
+    result[forward] = (-3 * field[forward] + 4 * plus[forward] - np.roll(field, -2, axis)[forward]) / (2 * dx)
+    result[backward] = (3 * field[backward] - 4 * minus[backward] + np.roll(field, 2, axis)[backward]) / (2 * dx)
+    result[first_forward] = (plus[first_forward] - field[first_forward]) / dx
+    result[first_backward] = (field[first_backward] - minus[first_backward]) / dx
+    cached = fallbacks.get(axis) if fallbacks is not None else None
+    if cached is None:
+        fit = LocalFluidFit(fluid, np.argwhere(isolated), derivative=axis) if np.any(isolated) else None
+        cached = {
+            "first_order_cells": int(np.count_nonzero(first_forward | first_backward)),
+            "affine_fit_cells": int(np.count_nonzero(isolated)),
+            "rank_deficient_fits": fit.rank_deficient if fit is not None else 0,
+            "fit": fit,
+        }
+        if fallbacks is not None:
+            fallbacks[axis] = cached
+    if cached["fit"] is not None:
+        result[isolated] = cached["fit"](field) / dx
     return result
 
 

@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 from numpy.testing import assert_allclose
@@ -54,6 +55,12 @@ def config():
     }
 
 
+def synthetic_state():
+    """Minimal state interface for tests that replace the closure generator."""
+    metadata = {"derivatives": {}, "surface": {"buried_points": 0, "reduced_offset_points": 0, "affine_fit_points": 0}}
+    return SimpleNamespace(reconstruction_metadata=lambda: metadata)
+
+
 class NumericalTests(unittest.TestCase):
     def test_fourier_gaussian_and_derivative(self):
         grid = Grid((16, 18, 20), (2, 3, 4))
@@ -93,8 +100,9 @@ class NumericalTests(unittest.TestCase):
         assert_allclose(derivative[fluid], expected[fluid], atol=1e-13)
         fluid[:] = False
         fluid[5] = True
-        with self.assertRaisesRegex(ValueError, "stencil"):
-            fluid_derivative(field, fluid, 0, grid.dx[0])
+        # A single layer cannot determine its normal derivative. The documented
+        # minimum-norm fallback is constant in that unresolved direction.
+        assert_allclose(fluid_derivative(field, fluid, 0, grid.dx[0]), 0, atol=0)
 
     def test_analytic_momentum_and_energy_closures(self):
         grid = Grid((20, 8, 8), (1, 1, 1))

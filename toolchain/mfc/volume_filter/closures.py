@@ -5,14 +5,15 @@ from time import perf_counter
 import numpy as np
 from numpy.polynomial.legendre import leggauss
 
-from .numerics import Gaussian, SpectralDerivatives, fluid_derivative, sphere_mask
+from .numerics import Gaussian, LocalFluidFit, SpectralDerivatives, fluid_derivative, sphere_mask
 
 
 class Surface:
     """Sphere quadrature with fluid-only, one-sided extrapolation of surface traces.
 
-    Two trilinear samples at d and 2d give 2*f(d)-f(2d). This is an
-    independent reconstruction, not a reproduction of MFC's IB force stencil.
+    Two trilinear samples at d and 2d give 2*f(d)-f(2d). Obstructed pairs
+    reduce d, then use a local fluid-only affine fit if no pair is supported.
+    This is not a reproduction of MFC's IB force stencil.
     """
 
     def __init__(self, grid, particles, fluid, config):
@@ -26,12 +27,27 @@ class Surface:
         normal = np.stack([np.sqrt(1 - zz**2) * np.cos(pp), np.sqrt(1 - zz**2) * np.sin(pp), zz], axis=-1).reshape(-1, 3)
         area = np.repeat(w, len(phi)) * (2 * np.pi / len(phi))
         points, normals, areas, velocities = [], [], [], []
-        for particle in particles:
+        buried = 0
+        for owner, particle in enumerate(particles):
             radial = particle[19] * normal
-            points.append(particle[16:19] + radial)
-            normals.append(normal)
-            areas.append(particle[19] ** 2 * area)
-            velocities.append(particle[7:10] + np.cross(particle[10:13], radial))
+            surface_points = particle[16:19] + radial
+            exposed = np.ones(len(normal), dtype=bool)
+            for other, neighbor in enumerate(particles):
+                if other == owner:
+                    continue
+                separation = grid.delta(particle[16:19], neighbor[16:19])
+                if np.dot(separation, separation) >= (particle[19] + neighbor[19]) ** 2:
+                    continue
+                delta = grid.delta(surface_points, neighbor[16:19])
+                exposed &= np.sum(delta**2, axis=1) >= neighbor[19] ** 2 * (1 - 32 * np.finfo(float).eps)
+                # Identical periodic surfaces belong to the first body only.
+                if other < owner and np.all(separation == 0) and particle[19] == neighbor[19]:
+                    exposed[:] = False
+            buried += int(np.count_nonzero(~exposed))
+            points.append(surface_points[exposed])
+            normals.append(normal[exposed])
+            areas.append(particle[19] ** 2 * area[exposed])
+            velocities.append((particle[7:10] + np.cross(particle[10:13], radial))[exposed])
         self.points = np.concatenate(points) if points else np.empty((0, 3))
         self.normals = np.concatenate(normals) if normals else np.empty((0, 3))
         self.areas = np.concatenate(areas) if areas else np.empty(0)
@@ -40,15 +56,42 @@ class Surface:
         if not np.isfinite(d) or d <= 0:
             raise ValueError("surface.offset_cells must be positive")
         self.near, self.far = self.points + d * self.normals, self.points + 2 * d * self.normals
-        # Check support even if mu=k=0, rather than silently sampling through neighbors.
-        self.trace(np.ones(grid.shape))
+        unit = np.broadcast_to(1.0, grid.shape)
+
+        def supported(near, far):
+            return np.isfinite(grid.sample(unit, near, fluid)) & np.isfinite(grid.sample(unit, far, fluid))
+
+        valid = supported(self.near, self.far)
+        original = valid.copy()
+        for factor in (0.5, 0.25, 0.125, 0.0625):
+            rows = np.flatnonzero(~valid)
+            if not len(rows):
+                break
+            near = self.points[rows] + factor * d * self.normals[rows]
+            far = self.points[rows] + 2 * factor * d * self.normals[rows]
+            good = supported(near, far)
+            self.near[rows[good]], self.far[rows[good]] = near[good], far[good]
+            valid[rows[good]] = True
+        self.unsupported = ~valid
+        coordinates = (self.points[self.unsupported] - grid.origin) / grid.dx - 0.5
+        self.fit = LocalFluidFit(fluid, coordinates) if len(coordinates) else None
+        self.metadata = {
+            "quadrature_points": len(self.points),
+            "buried_points": buried,
+            "reduced_offset_points": int(np.count_nonzero(valid & ~original)),
+            "affine_fit_points": int(np.count_nonzero(self.unsupported)),
+            "rank_deficient_fits": self.fit.rank_deficient if self.fit is not None else 0,
+            "expanded_search_points": self.fit.expanded if self.fit is not None else 0,
+        }
         self.force = np.zeros_like(self.points)
         self.heat = np.zeros(len(self.points))
 
     def trace(self, field):
         values = 2 * self.grid.sample(field, self.near, self.fluid) - self.grid.sample(field, self.far, self.fluid)
+        if self.fit is not None:
+            values[self.unsupported] = self.fit(field)
         if not np.all(np.isfinite(values)):
-            raise ValueError("Surface extrapolation hits solid/invalid support; refine grid or reduce surface.offset_cells and check convergence")
+            raise ValueError("Nonfinite fluid values in surface reconstruction")
         return values
 
     def sources(self, gaussian):
@@ -64,6 +107,8 @@ class State:
 
     def __init__(self, fields, fluid, physics, report=None):
         self.fluid, self.physics = fluid, physics
+        self.derivative_fallbacks = {}
+        self.surface_reconstruction = None
         self.rho = next(fields)
         if not np.all(np.isfinite(self.rho), where=fluid) or np.any((self.rho <= 0) & fluid):
             raise ValueError("Nonpositive/nonfinite fluid density")
@@ -106,7 +151,13 @@ class State:
             report("fluid primitive state ready")
 
     def derivative(self, field, grid, axis):
-        return fluid_derivative(field, self.fluid, axis, grid.dx[axis])
+        return fluid_derivative(field, self.fluid, axis, grid.dx[axis], self.derivative_fallbacks)
+
+    def reconstruction_metadata(self):
+        return {
+            "derivatives": {"xyz"[axis]: {name: value for name, value in info.items() if name != "fit"} for axis, info in sorted(self.derivative_fallbacks.items())},
+            "surface": self.surface_reconstruction,
+        }
 
 
 def closure_fields(grid, state, particles, sigma, config):
@@ -151,6 +202,7 @@ def closure_fields(grid, state, particles, sigma, config):
     raw_div = sum(state.derivative(state.u[i], grid, i) for i in range(3)) if mu else None
     resolved_div = sum(velocity_gradient(i, i) for i in range(3)) if mu else None
     surface = Surface(grid, particles, fluid, config["surface"])
+    state.surface_reconstruction = surface.metadata
     surface.force = surface.trace(state.p)[:, None] * surface.normals
     if config["surface"].get("velocity_bc", "no_slip") == "slip":
         trace_u = np.column_stack([surface.trace(u) for u in state.u])
