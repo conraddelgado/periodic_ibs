@@ -23,7 +23,7 @@ class ParticlePDFTests(unittest.TestCase):
         pooled = np.concatenate(groups)
         for column, field in enumerate(fields):
             prefix = f"{field}.pdf."
-            self.assertEqual(set(key[len(prefix):] for key in arrays if key.startswith(prefix)), set(PDF_ARRAYS))
+            self.assertEqual(set(key[len(prefix) :] for key in arrays if key.startswith(prefix)), set(PDF_ARRAYS))
             edges, counts = arrays[prefix + "bin_edges"], arrays[prefix + "counts"]
             expected, _ = np.histogram(pooled[:, column], bins=edges)
             assert_array_equal(arrays[prefix + "samples"], pooled[:, column])
