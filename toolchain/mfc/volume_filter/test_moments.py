@@ -11,7 +11,7 @@ from unittest.mock import patch
 import numpy as np
 from numpy.testing import assert_allclose, assert_array_equal
 
-from .__main__ import KEY_FORMAT, PARTICLE_FIELDS, STATISTICS, VERSION, atomic_save, pack, run
+from .__main__ import HYDRO_PARTICLE_FIELDS, KEY_FORMAT, PARTICLE_FIELDS, STATISTICS, VERSION, atomic_save, pack, run
 from .compact import convert
 from .maps import Moments
 from .test_volume_filter import config, particles, synthetic_state
@@ -202,7 +202,7 @@ class MomentTests(unittest.TestCase):
                 progress_log = StringIO()
                 with (
                     redirect_stdout(progress_log),
-                    patch("mfc.volume_filter.__main__.reconstruct", side_effect=lambda *args: synthetic_state()),
+                    patch("mfc.volume_filter.__main__.reconstruct", side_effect=lambda *args: synthetic_state(len(args[2]))),
                     patch("mfc.volume_filter.__main__.closure_fields", side_effect=synthetic_fields),
                     patch("mfc.volume_filter.__main__.atomic_save", wraps=atomic_save) as save,
                 ):
@@ -230,6 +230,7 @@ class MomentTests(unittest.TestCase):
                     self.assertEqual(metadata["statistics"]["outputs"], list(STATISTICS))
                     expected_keys = {"metadata"} | {f"F_x.{name}.sigma{i}" for name in STATISTICS for i in (0, 1)}
                     expected_keys |= {f"{field}.{statistic}" for field in PARTICLE_FIELDS for statistic in STATISTICS}
+                    expected_keys |= {f"{field}.{statistic}" for field in HYDRO_PARTICLE_FIELDS for statistic in STATISTICS}
                     self.assertEqual(set(data.files), expected_keys)
                     for i, sigma in enumerate(cfg["sigmas"]):
                         samples = np.broadcast_to(np.array(expected)[:, None, None, None] + np.linspace(-0.0625, 0.0625, 3)[None, :, None, None], (6, 3, 3, 3))

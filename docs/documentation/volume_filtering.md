@@ -575,8 +575,9 @@ contains `metadata` and the scalar particle-force/torque statistics described
 below. No `.time`, `.pooled`, raw moments, central moments, counts,
 weights, central sums, or excess-kurtosis arrays are saved. All statistics use
 the equally weighted particle/timestep ensemble. With all 59 fields and one
-filter width, the NPZ has 261 keys including metadata and 24 particle-load scalars
-(237 keys before particle-load statistics were added).
+filter width, the NPZ has 285 keys including metadata, 24 saved particle-load
+scalars, and 24 reconstructed hydrodynamic particle-load scalars (261 keys
+before hydrodynamic loads were added).
 
 An unsupported location has NaN statistics. A constant realization sequence has
 zero variance and NaN skewness/kurtosis. Invalid samples are excluded separately
@@ -628,9 +629,11 @@ indices, axial then radial, and retain moments of each particle's ring average.
 Full map interpolation is still performed; this option reduces retained history
 storage, not closure or map computation. Each configured filter is recorded.
 
-Omit `fields` and `map_indices` to retain only the six particle-load histories.
-Set `particle_loads: false` to omit those histories. The force/torque source and
-stage-timing qualifications below also apply to diagnostics.
+Omit `fields` and `map_indices` to retain only the particle-load histories:
+six saved and six reconstructed hydrodynamic components. Set
+`particle_loads: false` to omit both sets of load histories; their primary scalar
+statistics are still computed. The force/torque source and stage-timing
+qualifications below also apply to saved-load diagnostics.
 
 The same final NPZ additionally contains:
 
@@ -642,6 +645,7 @@ The same final NPZ additionally contains:
 | `diagnostics.F_x.sigma0.mean` | (snapshot, probe), particle mean before time pooling |
 | `diagnostics.F_x.sigma0.m2`, `.m3`, `.m4` | Unnormalized central sums within each snapshot |
 | `diagnostics.particle_force_x.mean` | (snapshot, 1), particle-average saved force |
+| `diagnostics.particle_hydro_force_x.mean` | (snapshot, 1), particle-average reconstructed hydrodynamic force |
 
 Every history has count, mean, m2, m3, and m4 arrays. The count remains int64;
 central sums and means remain float64. Empty support has zero count and must not
@@ -750,7 +754,7 @@ for correlated DNS sampling uncertainty, and
 [Bergmann et al., Journal of Turbomachinery 144, 031005 (2022)](https://doi.org/10.1115/1.4052402)
 for transient screening and statistical convergence in turbulent simulations.
 
-### Scalar particle forces and torques
+### Scalar particle forces and torques saved by MFC
 
 Each run also accumulates the three signed force and three signed torque
 components saved in `ib_state`: one-based record fields 2--4 and 5--7,
@@ -785,6 +789,65 @@ and NaN skewness/kurtosis. Metadata's `particle_statistics` describes the source
 record columns, scalar key format, and total realization count. Older version-3
 files and converted version-2 files lack these newly added entries.
 
+### Reconstructed hydrodynamic particle forces and torques
+
+Every run also integrates the reconstructed pressure and viscous traction over
+each particle's exposed surface, before deposition or Gaussian filtering. With
+n pointing from the solid into the fluid and r measured from the particle
+centroid, the fluid-on-particle loads are
+
+\f[
+\mathbf{F}^{hydro}_p = \int_{S_p}(-p\mathbf{n} + \boldsymbol{\tau}\mathbf{n})\,dS,
+\qquad
+\mathbf{T}^{hydro}_p = \int_{S_p}\mathbf{r}\mathbin{\times}
+(-p\mathbf{n} + \boldsymbol{\tau}\mathbf{n})\,dS.
+\f]
+
+This uses the same one-sided fluid-only pressure/stress traces and quadrature
+as the interphase source fields, with the opposite force sign. It does not use
+the saved `ib_state` force, a drag correlation, or an assumed control acceleration.
+Particle body/control forces and contact forces are excluded. For a suspension
+held at steady mean particle velocity by an opposing body force, the saved net
+force can average to zero while this hydrodynamic force remains nonzero.
+
+| Example key | Meaning |
+|---|---|
+| `particle_hydro_force_x.mean` | Mean reconstructed fluid-on-particle x force |
+| `particle_hydro_force_x.variance` | Population variance across particle/timestep pairs |
+| `particle_hydro_force_x.skewness` | Standardized third central moment |
+| `particle_hydro_force_x.kurtosis` | Pearson kurtosis |
+| `particle_hydro_torque_z.mean` | Mean reconstructed hydrodynamic centroid torque |
+
+The six components are `particle_hydro_force_x/y/z` and
+`particle_hydro_torque_x/y/z`, adding **24 scalar entries**. For the supplied
+x-directed cases, `particle_hydro_force_x` is signed streamwise hydrodynamic
+drag. Components remain in fixed laboratory axes; no magnitude, slip-direction
+projection, or drag coefficient is inferred. Force and torque use the simulation's
+force and force-times-length units (N and N m for SI input).
+
+The processor computes each particle's load separately, then accumulates mean,
+population variance, skewness, and Pearson kurtosis over equally weighted
+particle/timestep pairs, including within-snapshot scatter. Each load is counted
+once per snapshot, regardless of the number of filter widths or mapped `fields`
+selection. These scalar keys have no `.sigma` suffix. No new configuration or
+input files are required. Optional `diagnostics.particle_hydro_force_x.*` and
+corresponding component histories preserve snapshot counts and central sums
+under the existing `diagnostics.particle_loads` switch.
+
+These are numerical hydrodynamic reconstructions, with the surface accuracy
+limits described above, rather than reproductions of MFC's IB force stencil.
+For overlapping spheres, buried quadrature is excluded without area
+renormalization, consistently with the source maps. Completely buried bodies
+have zero exposed-surface load; coincident surfaces belong to the first body.
+Periodic images retain their original particle ownership, and torque uses
+unwrapped radial vectors about each centroid. The sum of reconstructed particle
+forces is minus the full-domain integral of F, independently of filter width;
+an integral over a cropped particle-centered map is not this full-domain check.
+Metadata's `hydrodynamic_particle_statistics` records the source, sign, torque
+origin, exclusions, and realization count separately from saved-load metadata.
+Existing NPZ files cannot acquire these loads from saved net-force moments alone:
+rerun postprocessing on the fluid/particle restarts, using a new output filename.
+
 Plotting loops should handle scalars before parsing map keys or slicing arrays:
 
 ```python
@@ -809,6 +872,7 @@ with np.load("closure_statistics.npz", allow_pickle=False) as data:
     kurtosis = data["F_x.kurtosis.sigma0"]
     mean_particle_force_y = data["particle_force_y.mean"].item()
     mean_particle_torque_z = data["particle_torque_z.mean"].item()
+    mean_hydrodynamic_drag = data["particle_hydro_force_x.mean"].item()
 ```
 
 Completed version-2 output files can be reduced without rerunning the simulation

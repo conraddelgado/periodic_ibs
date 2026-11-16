@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 from numpy.testing import assert_allclose
 
-from .__main__ import PARTICLE_FIELDS, STATISTICS, run
+from .__main__ import HYDRO_PARTICLE_FIELDS, PARTICLE_FIELDS, STATISTICS, run
 from .numerics import Grid
 from .test_volume_filter import config, conservative, particles
 
@@ -61,6 +61,7 @@ class ParallelSnapshotTests(unittest.TestCase):
                 self.assertEqual(metadata["particle_statistics"]["shape"], [])
                 self.assertEqual(metadata["particle_statistics"]["record_columns_one_based"], {name: column + 1 for name, column in PARTICLE_FIELDS.items()})
                 expected_keys = {f"{name}.{statistic}" for name in PARTICLE_FIELDS for statistic in STATISTICS}
+                expected_keys |= {f"{name}.{statistic}" for name in HYDRO_PARTICLE_FIELDS for statistic in STATISTICS}
                 self.assertEqual({key for key in parallel.files if key.startswith("particle_")}, expected_keys)
                 samples = np.asarray(load_samples)
                 for name, column in PARTICLE_FIELDS.items():

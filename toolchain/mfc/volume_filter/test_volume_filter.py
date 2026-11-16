@@ -55,10 +55,10 @@ def config():
     }
 
 
-def synthetic_state():
+def synthetic_state(particle_count):
     """Minimal state interface for tests that replace the closure generator."""
     metadata = {"derivatives": {}, "surface": {"buried_points": 0, "reduced_offset_points": 0, "affine_fit_points": 0}}
-    return SimpleNamespace(reconstruction_metadata=lambda: metadata)
+    return SimpleNamespace(reconstruction_metadata=lambda: metadata, hydrodynamic_loads=np.zeros((particle_count, 6)))
 
 
 class NumericalTests(unittest.TestCase):
@@ -380,7 +380,7 @@ class ReaderAndPipelineTests(unittest.TestCase):
                 self.assertEqual(metadata["output_mode"], "final_only")
                 self.assertTrue(np.all(np.isfinite(data["alpha.mean.sigma0"])))
                 assert_allclose(data["alpha.variance.sigma0"], 0)
-                self.assertEqual(len(data.files), 1 + 4 * len(cfg["fields"]) + 24)
+                self.assertEqual(len(data.files), 1 + 4 * len(cfg["fields"]) + 48)
             self.assertEqual([p.name for p in root.glob("*.npz")], ["stats.npz"])
             before = (root / "stats.npz").read_bytes()
             with self.assertRaises(FileExistsError):
