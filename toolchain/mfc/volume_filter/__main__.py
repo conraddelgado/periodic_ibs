@@ -22,6 +22,7 @@ STATISTICS = ("mean", "variance", "skewness", "kurtosis")
 KEY_FORMAT = "{field}.{statistic}.sigma{filter_index}"
 PARTICLE_KEY_FORMAT = "{field}.{statistic}"
 PARTICLE_FIELDS = {f"particle_{kind}_{axis}": start + offset for kind, start in (("force", 1), ("torque", 4)) for offset, axis in enumerate("xyz")}
+HYDRO_PARTICLE_FIELDS = {f"particle_hydro_{kind}_{axis}": start + offset for kind, start in (("force", 0), ("torque", 3)) for offset, axis in enumerate("xyz")}
 
 
 def atomic_save(path, arrays):
@@ -91,6 +92,21 @@ def pack(moments, metadata, records=None):
         yield from history_arrays(records)
 
 
+def accumulate_particle_loads(moments, loads, columns, history=None):
+    """Pool individual particle samples, without first averaging each snapshot."""
+    for name, column in columns.items():
+        key = (name, None)
+        if key not in moments:
+            moments[key] = Moments(())
+        snapshot_load = Moments(()) if history is not None else None
+        for value in loads[:, column]:
+            moments[key].update(value)
+            if snapshot_load is not None:
+                snapshot_load.update(value)
+        if snapshot_load is not None:
+            history[name] = capture(snapshot_load)
+
+
 def process_snapshots(config, root, indices, progress_interval, worker_id=None):
     """Process one snapshot at a time within one independent worker."""
     grid = Grid(**config["grid"])
@@ -115,17 +131,8 @@ def process_snapshots(config, root, indices, progress_interval, worker_id=None):
         history = {} if diagnostic_options is not None else None
         if history is not None and (not np.all(np.isfinite(particles[:, 0])) or np.any(particles[:, 0] != particles[0, 0])):
             raise ValueError("Diagnostic particle timestamps must be finite and identical within a snapshot")
-        for name, column in PARTICLE_FIELDS.items():
-            key = (name, None)
-            if key not in moments:
-                moments[key] = Moments(())
-            snapshot_load = Moments(()) if history is not None and diagnostic_options["particle_loads"] else None
-            for value in particles[:, column]:
-                moments[key].update(value)
-                if snapshot_load is not None:
-                    snapshot_load.update(value)
-            if snapshot_load is not None:
-                history[name] = capture(snapshot_load)
+        load_history = history if history is not None and diagnostic_options["particle_loads"] else None
+        accumulate_particle_loads(moments, particles, PARTICLE_FIELDS, load_history)
         time = float(particles[0, 0])  # File timestamp is descriptive metadata only.
         state = reconstruct(grid, reader.fields(step), particles, config["physics"])
         report(f"fluid ready; time={time}, particles={len(particles)}, map backend={mapper.backend}")
@@ -155,6 +162,7 @@ def process_snapshots(config, root, indices, progress_interval, worker_id=None):
                 raise ValueError(f"Unknown fields: {sorted(selected - seen)}")
             if diagnostic_options is not None and set(diagnostic_options["fields"]) - seen:
                 raise ValueError(f"Unknown diagnostic fields: {sorted(set(diagnostic_options['fields']) - seen)}")
+        accumulate_particle_loads(moments, state.hydrodynamic_loads, HYDRO_PARTICLE_FIELDS, load_history)
         reconstruction = state.reconstruction_metadata()
         del state
         if reader.fingerprint(step) != fingerprint:
@@ -240,6 +248,19 @@ def run(config_path, progress_interval=5.0, snapshot_workers=1):
         "record_columns_one_based": {name: column + 1 for name, column in PARTICLE_FIELDS.items()},
         "realizations": sum(metadata["particle_counts"]),
         "weighting": "equal_particle_timestep_pairs",
+    }
+    metadata["hydrodynamic_particle_statistics"] = {
+        "fields": list(HYDRO_PARTICLE_FIELDS),
+        "key_format": PARTICLE_KEY_FORMAT,
+        "shape": [],
+        "source": "reconstructed_unfiltered_pressure_and_viscous_surface_traction",
+        "force_convention": "fluid_on_particle; integral of (-p*n + tau*n) over exposed surface",
+        "torque_origin": "particle centroid; unwrapped radial quadrature vectors",
+        "units": {"force": "simulation force units", "torque": "simulation force times length units"},
+        "excluded": ["particle_body_forces", "particle_control_forces", "collision_forces"],
+        "realizations": sum(metadata["particle_counts"]),
+        "weighting": "equal_particle_timestep_pairs",
+        "filter_dependent": False,
     }
     metadata["snapshot_seconds"] = [item["seconds"] for item in records]
     metadata["reconstruction"] = {

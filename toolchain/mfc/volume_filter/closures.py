@@ -26,7 +26,8 @@ class Surface:
         zz, pp = np.meshgrid(z, phi, indexing="ij")
         normal = np.stack([np.sqrt(1 - zz**2) * np.cos(pp), np.sqrt(1 - zz**2) * np.sin(pp), zz], axis=-1).reshape(-1, 3)
         area = np.repeat(w, len(phi)) * (2 * np.pi / len(phi))
-        points, normals, areas, velocities = [], [], [], []
+        points, normals, areas, velocities, owners, radials = [], [], [], [], [], []
+        self.particle_count = len(particles)
         buried = 0
         for owner, particle in enumerate(particles):
             radial = particle[19] * normal
@@ -48,10 +49,14 @@ class Surface:
             normals.append(normal[exposed])
             areas.append(particle[19] ** 2 * area[exposed])
             velocities.append((particle[7:10] + np.cross(particle[10:13], radial))[exposed])
+            owners.append(np.full(np.count_nonzero(exposed), owner, dtype=np.int64))
+            radials.append(radial[exposed])
         self.points = np.concatenate(points) if points else np.empty((0, 3))
         self.normals = np.concatenate(normals) if normals else np.empty((0, 3))
         self.areas = np.concatenate(areas) if areas else np.empty(0)
         self.velocity = np.concatenate(velocities) if velocities else np.empty((0, 3))
+        self.owners = np.concatenate(owners) if owners else np.empty(0, dtype=np.int64)
+        self.radials = np.concatenate(radials) if radials else np.empty((0, 3))
         d = config.get("offset_cells", 2.0) * max(grid.dx)
         if not np.isfinite(d) or d <= 0:
             raise ValueError("surface.offset_cells must be positive")
@@ -101,6 +106,20 @@ class Surface:
         power = np.einsum("ni,ni->n", self.force, self.velocity)
         yield "F_u", gaussian(self.grid.deposit(self.points, self.areas * power))
 
+    def particle_loads(self):
+        """Integrate fluid-on-particle force and centroid torque, before filtering.
+
+        self.force is the opposite traction, p*n - tau*n, used in fluid sources.
+        Retain the existing exposed-union surface convention for overlaps; a
+        completely buried body has no exposed quadrature and receives zero.
+        """
+        traction = -self.areas[:, None] * self.force
+        force = np.zeros((self.particle_count, 3))
+        torque = np.zeros_like(force)
+        np.add.at(force, self.owners, traction)
+        np.add.at(torque, self.owners, np.cross(self.radials, traction))
+        return np.column_stack((force, torque))
+
 
 class State:
     """Primitive reconstruction for a calorically perfect single gas."""
@@ -109,6 +128,7 @@ class State:
         self.fluid, self.physics = fluid, physics
         self.derivative_fallbacks = {}
         self.surface_reconstruction = None
+        self.hydrodynamic_loads = None
         self.rho = next(fields)
         if not np.all(np.isfinite(self.rho), where=fluid) or np.any((self.rho <= 0) & fluid):
             raise ValueError("Nonpositive/nonfinite fluid density")
@@ -239,6 +259,11 @@ def closure_fields(grid, state, particles, sigma, config):
             else:
                 yield from intrinsic(f"R_mu_{suffix}", np.zeros(grid.shape))
     del raw_div, resolved_div
+
+    # Raw pressure/viscous traction has no sigma dependence. Keep just the first
+    # filter's small per-particle array for scalar statistics after mapping ends.
+    if state.hydrodynamic_loads is None:
+        state.hydrodynamic_loads = surface.particle_loads()
 
     speed2_volume = filt(state.rho * state.speed2)
     gamma_factor = physics["gamma"] / (physics["gamma"] - 1)
