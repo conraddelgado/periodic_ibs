@@ -46,8 +46,6 @@ def direct_statistics(values, weights=None):
     return {
         "mean": mean,
         "variance": variance,
-        "skewness": np.average(centered**3, weights=weights) / variance**1.5,
-        "kurtosis": np.average(centered**4, weights=weights) / variance**2,
     }
 
 
@@ -117,7 +115,7 @@ class DiagnosticsTests(unittest.TestCase):
                 assert_allclose(result["diagnostics.particle_force_x.mean"][:, 0], [2, 4, 6])
                 assert_allclose(result["diagnostics.particle_force_x.m2"][:, 0], [2, 8, 18])
                 metadata = json.loads(str(result["metadata"]))
-                self.assertEqual(metadata["diagnostics"]["version"], 1)
+                self.assertEqual(metadata["diagnostics"]["version"], 2)
             times, histories = load_histories(root / "history.npz", ["F_x.sigma0"])
             self.assertEqual(set(histories), {"F_x.sigma0"})
             assert_allclose(times, [0.1, 0.2, 0.3])
@@ -155,7 +153,7 @@ class SamplingTests(unittest.TestCase):
         factor = correlation_factor(autocorrelation(correlated, 128), len(correlated))
         self.assertAlmostEqual(factor / ((1 + phi) / (1 - phi)), 1, delta=0.3)
 
-    def test_ratio_and_higher_moment_influences_match_weight_perturbations(self):
+    def test_mean_and_variance_influences_match_weight_perturbations(self):
         groups = [np.array([-2.0]), np.array([1.0, 3.0, 8.0]), np.array([-1.0, 4.0]), np.array([])]
         history = history_from_groups(groups)
         total = merge_rows(history, range(len(groups)))

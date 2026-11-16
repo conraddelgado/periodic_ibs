@@ -7,14 +7,14 @@ from numba import config, get_num_threads, njit, prange, set_num_threads
 
 
 @njit(cache=True, parallel=True, fastmath=False)
-def _box_moments(field, lo, hi, fraction, count, weight, means, second, third, fourth):
+def _box_moments(field, lo, hi, fraction, count, weight, means, second):
     points = lo.shape[2]
     for point in prange(means.size):
         ix = point // (points * points)
         iy = (point // points) % points
         iz = point % points
         n = 0
-        mean = m2 = m3 = m4 = 0.0
+        mean = m2 = 0.0
         for particle in range(lo.shape[0]):
             x, y, z = lo[particle, 0, ix], lo[particle, 1, iy], lo[particle, 2, iz]
             x1, y1, z1 = hi[particle, 0, ix], hi[particle, 1, iy], hi[particle, 2, iz]
@@ -38,10 +38,7 @@ def _box_moments(field, lo, hi, fraction, count, weight, means, second, third, f
             total = n + 1
             delta = value - mean if n else 0.0
             delta_n = delta / total
-            delta_n2 = delta_n * delta_n
             term = delta * delta_n * n
-            m4 += term * delta_n2 * (total * total - 3 * total + 3) + 6 * delta_n2 * m2 - 4 * delta_n * m3
-            m3 += term * delta_n * (total - 2) - 3 * delta_n * m2
             m2 += term
             mean = mean + delta_n if n else value
             n = total
@@ -49,8 +46,6 @@ def _box_moments(field, lo, hi, fraction, count, weight, means, second, third, f
         weight[point] = n
         means[point] = mean
         second[point] = m2
-        third[point] = m3
-        fourth[point] = m4
 
 
 def map_box(grid, axis, field, states, result, *, workers):
@@ -64,7 +59,7 @@ def map_box(grid, axis, field, states, result, *, workers):
     threads = workers if workers > 0 else max(1, (os.cpu_count() or 1) + workers + 1)
     set_num_threads(min(threads, config.NUMBA_NUM_THREADS))
     try:
-        arrays = tuple(getattr(result, name).ravel() for name in ("count", "weight", "mean", "m2", "m3", "m4"))
+        arrays = tuple(getattr(result, name).ravel() for name in ("count", "weight", "mean", "m2"))
         _box_moments(np.asarray(field, dtype=float), lo, hi, fraction, *arrays)
     finally:
         set_num_threads(previous_threads)

@@ -8,8 +8,9 @@ from pathlib import Path
 import numpy as np
 from numpy.testing import assert_allclose
 
-from .__main__ import HYDRO_PARTICLE_FIELDS, PARTICLE_FIELDS, STATISTICS, run
+from .__main__ import HYDRO_PARTICLE_FIELDS, PARTICLE_FIELDS, PDF_FIELDS, STATISTICS, run
 from .numerics import Grid
+from .pdfs import PDF_ARRAYS
 from .test_volume_filter import config, conservative, particles
 
 
@@ -62,13 +63,20 @@ class ParallelSnapshotTests(unittest.TestCase):
                 self.assertEqual(metadata["particle_statistics"]["record_columns_one_based"], {name: column + 1 for name, column in PARTICLE_FIELDS.items()})
                 expected_keys = {f"{name}.{statistic}" for name in PARTICLE_FIELDS for statistic in STATISTICS}
                 expected_keys |= {f"{name}.{statistic}" for name in HYDRO_PARTICLE_FIELDS for statistic in STATISTICS}
+                expected_keys |= {f"{name}.pdf.{quantity}" for name in PDF_FIELDS for quantity in PDF_ARRAYS}
                 self.assertEqual({key for key in parallel.files if key.startswith("particle_")}, expected_keys)
                 samples = np.asarray(load_samples)
                 for name, column in PARTICLE_FIELDS.items():
                     values = samples[:, column - 1]
+                    pdf_prefix = f"{name}.pdf."
+                    edges = parallel[pdf_prefix + "bin_edges"]
+                    expected_counts, _ = np.histogram(values, bins=edges)
+                    assert_allclose(parallel[pdf_prefix + "counts"], expected_counts)
+                    self.assertEqual(parallel[pdf_prefix + "sample_count"].item(), len(values))
+                    assert_allclose(np.sum(parallel[pdf_prefix + "density"] * np.diff(edges)), 1)
                     centered = values - values.mean()
                     variance = np.mean(centered**2)
-                    expected = (values.mean(), variance, np.mean(centered**3) / variance**1.5 if variance > 0 else np.nan, np.mean(centered**4) / variance**2 if variance > 0 else np.nan)
+                    expected = (values.mean(), variance)
                     for statistic, value in zip(STATISTICS, expected):
                         for output in (serial, parallel):
                             actual = output[f"{name}.{statistic}"]

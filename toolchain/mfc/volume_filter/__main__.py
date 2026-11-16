@@ -15,14 +15,17 @@ from .closures import closure_fields, reconstruct
 from .diagnostics import capture, history_arrays, validate_diagnostics
 from .maps import Moments, ParticleMap
 from .numerics import Grid
+from .pdfs import particle_pdfs
 from .reader import Reader
 
-VERSION = 3
-STATISTICS = ("mean", "variance", "skewness", "kurtosis")
+VERSION = 4
+STATISTICS = ("mean", "variance")
 KEY_FORMAT = "{field}.{statistic}.sigma{filter_index}"
 PARTICLE_KEY_FORMAT = "{field}.{statistic}"
 PARTICLE_FIELDS = {f"particle_{kind}_{axis}": start + offset for kind, start in (("force", 1), ("torque", 4)) for offset, axis in enumerate("xyz")}
 HYDRO_PARTICLE_FIELDS = {f"particle_hydro_{kind}_{axis}": start + offset for kind, start in (("force", 0), ("torque", 3)) for offset, axis in enumerate("xyz")}
+
+PDF_FIELDS = tuple(PARTICLE_FIELDS) + tuple(HYDRO_PARTICLE_FIELDS)
 
 
 def atomic_save(path, arrays):
@@ -77,10 +80,13 @@ def validate(config):
     config["snapshots"] = steps
     config.pop("time_weighting", None)
     config.pop("save_snapshot_maps", None)
+    bins = config.setdefault("particle_pdf_bins", 100)
+    if type(bins) is not int or bins < 1:
+        raise ValueError("particle_pdf_bins must be a positive integer")
     validate_diagnostics(config)
 
 
-def pack(moments, metadata, records=None):
+def pack(moments, metadata, records=None, pdf_arrays=None):
     yield "metadata", np.array(json.dumps(metadata, sort_keys=True))
     for (name, sigma_index), value in moments.items():
         for statistic in STATISTICS:
@@ -90,6 +96,8 @@ def pack(moments, metadata, records=None):
 
     if records is not None:
         yield from history_arrays(records)
+    if pdf_arrays is not None:
+        yield from pdf_arrays.items()
 
 
 def accumulate_particle_loads(moments, loads, columns, history=None):
@@ -163,6 +171,7 @@ def process_snapshots(config, root, indices, progress_interval, worker_id=None):
             if diagnostic_options is not None and set(diagnostic_options["fields"]) - seen:
                 raise ValueError(f"Unknown diagnostic fields: {sorted(set(diagnostic_options['fields']) - seen)}")
         accumulate_particle_loads(moments, state.hydrodynamic_loads, HYDRO_PARTICLE_FIELDS, load_history)
+        load_samples = np.column_stack((particles[:, 1:7], state.hydrodynamic_loads))
         reconstruction = state.reconstruction_metadata()
         del state
         if reader.fingerprint(step) != fingerprint:
@@ -172,6 +181,7 @@ def process_snapshots(config, root, indices, progress_interval, worker_id=None):
             "step": step,
             "inputs": fingerprint,
             "particle_count": len(particles),
+            "particle_load_samples": load_samples,
             "time": time,
             "seconds": perf_counter() - snapshot_start,
             "map_backend": mapper.backend,
@@ -209,9 +219,8 @@ def run(config_path, progress_interval=5.0, snapshot_workers=1):
             "ensemble": "particle_timestep_pairs",
             "pooled_weighting": "equal_realizations",
             "outputs": list(STATISTICS),
-            "max_order": 4,
+            "max_order": 2,
             "normalization": "population",
-            "kurtosis": "Pearson",
         },
         "completed": 0,
         "inputs": [],
@@ -275,17 +284,30 @@ def run(config_path, progress_interval=5.0, snapshot_workers=1):
     diagnostic_records = records if "diagnostics" in config else None
     if diagnostic_records is not None:
         metadata["diagnostics"] = {
-            "version": 1,
+            "version": 2,
             "prefix": "diagnostics.",
             "shape": ["snapshot", "probe"],
             "map_indices": config["diagnostics"]["map_indices"],
-            "moments": ["count", "mean", "m2", "m3", "m4"],
+            "moments": ["count", "mean", "m2"],
             "central_sums": True,
             "particle_load_probes": 1,
             "weighting": "equal_particle_timestep_pairs",
         }
+    pdf_arrays, pdf_metadata = particle_pdfs(records, PDF_FIELDS, config["particle_pdf_bins"])
+    metadata["particle_pdfs"] = {
+        "version": 1,
+        "key_format": "{field}.pdf.{quantity}",
+        "requested_bins": config["particle_pdf_bins"],
+        "normalization": "counts / (finite particle-timestep samples * bin width)",
+        "weighting": "equal_particle_timestep_pairs",
+        "range": "full finite ensemble range per component; no tail clipping",
+        "density_units": "inverse of the component's simulation force or torque units",
+        "filter_dependent": False,
+        "raw_samples_saved": True,
+        "fields": pdf_metadata,
+    }
     print(f"Writing final statistics: {output}", flush=True)
-    atomic_save(output, pack(moments, metadata, diagnostic_records))
+    atomic_save(output, pack(moments, metadata, diagnostic_records, pdf_arrays))
     print(f"Final output saved: {output}", flush=True)
     return output
 

@@ -107,7 +107,7 @@ class HydrodynamicParticleTests(unittest.TestCase):
             samples = np.asarray(samples)
             validate(cfg)
             with contextlib.redirect_stdout(io.StringIO()):
-                moments, _ = process_snapshots(cfg, root, range(3), 0)
+                moments, records = process_snapshots(cfg, root, range(3), 0)
             for name in HYDRO_PARTICLE_FIELDS:
                 self.assertEqual(moments[name, None].count.item(), 6)
                 self.assertEqual(moments[name, None].weight.item(), 6)
@@ -126,11 +126,20 @@ class HydrodynamicParticleTests(unittest.TestCase):
                     self.assertEqual(metadata["hydrodynamic_particle_statistics"]["realizations"], 6)
                     self.assertFalse(metadata["hydrodynamic_particle_statistics"]["filter_dependent"])
                     assert_allclose(result["particle_force_x.mean"], 0, atol=0)
+                    self.assertTrue(metadata["particle_pdfs"]["fields"]["particle_force_x"]["point_mass"])
+                    self.assertFalse(any(".skewness" in key or ".kurtosis" in key or key.endswith((".m3", ".m4")) for key in result.files))
+                    pooled_loads = np.concatenate([record["particle_load_samples"] for record in records])
                     for column, axis in enumerate("xyz"):
                         values = samples[:, column]
+                        pdf_prefix = f"particle_hydro_force_{axis}.pdf."
+                        edges = result[pdf_prefix + "bin_edges"]
+                        expected_counts, _ = np.histogram(pooled_loads[:, column + 6], bins=edges)
+                        assert_allclose(result[pdf_prefix + "counts"], expected_counts)
+                        self.assertEqual(result[pdf_prefix + "sample_count"].item(), 6)
+                        assert_allclose(np.sum(result[pdf_prefix + "density"] * np.diff(edges)), 1)
                         centered = values - values.mean()
                         variance = np.mean(centered**2)
-                        expected = [values.mean(), variance, np.mean(centered**3) / variance**1.5, np.mean(centered**4) / variance**2]
+                        expected = [values.mean(), variance]
                         for statistic, value in zip(STATISTICS, expected):
                             key = f"particle_hydro_force_{axis}.{statistic}"
                             self.assertEqual(result[key].shape, ())

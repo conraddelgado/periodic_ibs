@@ -1,4 +1,4 @@
-"""Convert completed version-2 statistics to the four-statistic output format.
+"""Convert completed version-2 statistics to mean/variance output.
 
 PYTHONPATH=toolchain python -m mfc.volume_filter.compact old.npz compact.npz
 """
@@ -17,7 +17,7 @@ def convert(source, output):
     source, output = Path(source).resolve(), Path(output).resolve()
     if output.exists():
         raise FileExistsError(f"{output} exists; select a new output path")
-    pattern = re.compile(r"^sigma(\d+)\.(.+)\.pooled\.(mean|variance|skewness|kurtosis)$")
+    pattern = re.compile(r"^sigma(\d+)\.(.+)\.pooled\.(mean|variance)$")
     with np.load(source, allow_pickle=False) as data:
         metadata = json.loads(str(data["metadata"]))
         statistics = metadata.get("statistics", {})
@@ -36,10 +36,12 @@ def convert(source, output):
             groups.setdefault(group, set()).add(statistic)
             entries.append((key, KEY_FORMAT.format(field=name, statistic=statistic, filter_index=int(index))))
         if not groups or any(values != set(STATISTICS) for values in groups.values()):
-            raise ValueError("Source must contain all four pooled statistics for every field/filter")
+            raise ValueError("Source must contain mean and variance for every field/filter")
         metadata.update(version=VERSION, output_mode="final_only", key_format=KEY_FORMAT)
         statistics.pop("snapshot_weighting", None)
         statistics["outputs"] = list(STATISTICS)
+        statistics["max_order"] = 2
+        statistics.pop("kurtosis", None)
 
         def arrays():
             yield "metadata", np.array(json.dumps(metadata, sort_keys=True))

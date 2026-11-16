@@ -1,4 +1,4 @@
-"""Pooled higher moments against direct sample statistics, including final output."""
+"""Pooled means and variances against direct samples, including final output."""
 
 import json
 import tempfile
@@ -11,9 +11,10 @@ from unittest.mock import patch
 import numpy as np
 from numpy.testing import assert_allclose, assert_array_equal
 
-from .__main__ import HYDRO_PARTICLE_FIELDS, KEY_FORMAT, PARTICLE_FIELDS, STATISTICS, VERSION, atomic_save, pack, run
+from .__main__ import HYDRO_PARTICLE_FIELDS, KEY_FORMAT, PARTICLE_FIELDS, PDF_FIELDS, STATISTICS, VERSION, atomic_save, pack, run
 from .compact import convert
 from .maps import Moments
+from .pdfs import PDF_ARRAYS
 from .test_volume_filter import config, particles, synthetic_state
 
 
@@ -29,6 +30,7 @@ class MomentTests(unittest.TestCase):
         if weights is None:
             weights = np.ones_like(samples)
         weights = np.broadcast_to(weights, samples.shape)
+        self.assertEqual(set(vars(result)), {"count", "weight", "mean", "m2"})
         for index in np.ndindex(result.mean.shape):
             values = samples[(slice(None), *index)]
             w = weights[(slice(None), *index)]
@@ -38,24 +40,15 @@ class MomentTests(unittest.TestCase):
             self.assertAlmostEqual(result.weight[index], float(w.sum()))
             if not len(values):
                 self.assertTrue(np.isnan(result.raw_moment(1)[index]))
-                for order in (2, 3, 4):
-                    self.assertTrue(np.isnan(result.central_moment(order)[index]))
+                self.assertTrue(np.isnan(result.variance[index]))
                 continue
             mean = np.sum(w * values) / w.sum()
+            variance = np.sum(w * (values - mean) ** 2) / w.sum()
             assert_allclose(result.mean[index], float(mean), rtol=rtol, atol=1e-13)
-            central = {}
-            for order in (2, 3, 4):
-                central[order] = np.sum(w * (values - mean) ** order) / w.sum()
-                assert_allclose(result.central_moment(order)[index], float(central[order]), rtol=rtol, atol=rtol)
-            for order in (1, 2, 3, 4):
+            assert_allclose(result.variance[index], float(variance), rtol=rtol, atol=rtol)
+            for order in (1, 2):
                 raw = np.sum(w * values**order) / w.sum()
                 assert_allclose(result.raw_moment(order)[index], float(raw), rtol=rtol, atol=rtol)
-            if central[2] > 0:
-                assert_allclose(result.skewness[index], float(central[3] / central[2] ** 1.5), rtol=rtol, atol=rtol)
-                assert_allclose(result.kurtosis[index], float(central[4] / central[2] ** 2), rtol=rtol, atol=rtol)
-            else:
-                self.assertTrue(np.isnan(result.skewness[index]))
-                self.assertTrue(np.isnan(result.kurtosis[index]))
 
     def test_asymmetric_stream_and_unequal_groups_match_direct(self):
         rng = np.random.default_rng(81)
@@ -94,7 +87,6 @@ class MomentTests(unittest.TestCase):
         result = accumulate(samples)
         self.assert_direct(result, samples)
         assert_allclose(result.variance[3], 4)  # Population normalization, not N-1.
-        assert_allclose(result.kurtosis[3], 1)
         empty = Moments((4,))
         result.merge(empty)
         self.assert_direct(result, samples)
@@ -144,7 +136,7 @@ class MomentTests(unittest.TestCase):
             arrays = {"metadata": np.array(json.dumps(metadata))}
             for index in (0, 1):
                 for name in ("F_x", "alpha_R_u_xx"):
-                    for j, statistic in enumerate(STATISTICS):
+                    for j, statistic in enumerate(("mean", "variance", "skewness", "kurtosis")):
                         value = np.array([index + j, np.nan])
                         arrays[f"sigma{index}.{name}.pooled.{statistic}"] = value
                         arrays[f"sigma{index}.{name}.time.{statistic}"] = value + 100
@@ -231,6 +223,7 @@ class MomentTests(unittest.TestCase):
                     expected_keys = {"metadata"} | {f"F_x.{name}.sigma{i}" for name in STATISTICS for i in (0, 1)}
                     expected_keys |= {f"{field}.{statistic}" for field in PARTICLE_FIELDS for statistic in STATISTICS}
                     expected_keys |= {f"{field}.{statistic}" for field in HYDRO_PARTICLE_FIELDS for statistic in STATISTICS}
+                    expected_keys |= {f"{field}.pdf.{quantity}" for field in PDF_FIELDS for quantity in PDF_ARRAYS}
                     self.assertEqual(set(data.files), expected_keys)
                     for i, sigma in enumerate(cfg["sigmas"]):
                         samples = np.broadcast_to(np.array(expected)[:, None, None, None] + np.linspace(-0.0625, 0.0625, 3)[None, :, None, None], (6, 3, 3, 3))

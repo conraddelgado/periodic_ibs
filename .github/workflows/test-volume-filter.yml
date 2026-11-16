@@ -1,0 +1,56 @@
+name: Volume Filter
+
+on:
+  pull_request:
+    paths:
+      - 'toolchain/mfc/volume_filter/**'
+      - 'misc/volume_filter/**'
+      - '.github/workflows/test-volume-filter.yml'
+      - '.ruff.toml'
+  push:
+    branches: [master]
+    paths:
+      - 'toolchain/mfc/volume_filter/**'
+      - 'misc/volume_filter/**'
+      - '.github/workflows/test-volume-filter.yml'
+      - '.ruff.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  volume-filter:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [numpy, numba]
+    env:
+      PYTHONPATH: toolchain
+      NUMBA_NUM_THREADS: '2'
+      OMP_NUM_THREADS: '2'
+      OPENBLAS_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Install numerical and lint dependencies
+        run: python -m pip install numpy scipy ruff==0.6.5
+      - name: Install Numba
+        if: matrix.backend == 'numba'
+        run: python -m pip install numba
+      - name: Lint volume-filter package and benchmarks
+        run: python -m ruff check toolchain/mfc/volume_filter misc/volume_filter
+      - name: Check formatting
+        if: always()
+        run: python -m ruff format --check --diff toolchain/mfc/volume_filter misc/volume_filter
+      - name: Run numerical and native-restart tests
+        if: always()
+        run: python -m unittest discover -s toolchain/mfc/volume_filter -t toolchain -p 'test_*.py' -v
+      - name: Smoke test map benchmark
+        run: python misc/volume_filter/benchmark_maps.py --points 3 --particles 2 --repeats 1
+      - name: Smoke test Numba benchmark
+        if: matrix.backend == 'numba'
+        run: python misc/volume_filter/benchmark_acceleration.py --grid 16 --points 3 --particles 3 --workers 2 --repeats 1

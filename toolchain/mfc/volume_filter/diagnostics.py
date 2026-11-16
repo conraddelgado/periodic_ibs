@@ -2,7 +2,7 @@
 
 import numpy as np
 
-ARRAYS = ("count", "mean", "m2", "m3", "m4")
+ARRAYS = ("count", "mean", "m2")
 PREFIX = "diagnostics."
 
 
