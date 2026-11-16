@@ -6,7 +6,7 @@ from multiprocessing.connection import wait
 
 from .maps import Moments
 
-ARRAYS = ("count", "weight", "mean", "m2", "m3", "m4")
+ARRAYS = ("count", "weight", "mean", "m2")
 
 
 def _worker(config, root, indices, interval, worker_id, connection):
@@ -27,7 +27,7 @@ def _worker(config, root, indices, interval, worker_id, connection):
 
 
 def run_workers(config, root, workers, interval):
-    """Return merged moments; no worker writes files or pickles large arrays."""
+    """Return merged moments and load samples; map arrays transfer individually."""
     context = mp.get_context("spawn")
     processes, pending = [], {}
     moments, records = {}, []

@@ -197,7 +197,7 @@ class CollisionTests(unittest.TestCase):
                     mean = values.mean(axis=0)
                     centered = values - mean
                     variance = np.mean(centered**2, axis=0)
-                    expected = {"mean": mean, "variance": variance, "skewness": np.mean(centered**3, axis=0) / variance**1.5, "kurtosis": np.mean(centered**4, axis=0) / variance**2}
+                    expected = {"mean": mean, "variance": variance}
                     for statistic, value in expected.items():
                         assert_allclose(serial[f"{name}.{statistic}.sigma{index}"], value, rtol=1e-8, atol=1e-10)
                 metadata = json.loads(str(serial["metadata"]))

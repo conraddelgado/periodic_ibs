@@ -19,9 +19,12 @@ non-spherical bodies require additional reconstruction logic and are not covered
 Execution is **single-node**, with optional independent snapshot processes
 (`--snapshot-workers`) and threaded SciPy FFTs (`fft_workers`). Each worker's global
 snapshot, work arrays, and accumulated moments must fit in RAM. Reading simulation MPI shards
-does not make this a distributed FFT implementation. With diagnostics disabled, memory is independent of the
-number of snapshots; it still grows with grid size, surface quadrature points,
-map size, and the number of retained statistics. A double scalar field on a
+does not make this a distributed FFT implementation. Map-accumulator memory is
+independent of the number of snapshots; it grows with grid size, surface quadrature
+points, map size, and the number of retained statistics. Load-PDF construction
+also retains 12 float64 load values per particle/timestep pair until the final
+histograms are built (96 bytes per pair, about 6 MB for 62,000 pairs). Optional
+diagnostic histories add their own snapshot/probe storage. A double scalar field on a
 512 x 256 x 256 grid is 256 MiB; budget several GiB beyond the input state for
 filtered fields, derivatives, and FFT temporaries. This is a draft analysis tool:
 validate interface reconstruction against a representative DNS before production.
@@ -83,9 +86,9 @@ independent copies with `srun -n N` would duplicate work and race on the output.
 This option uses Python's spawned processes, not MPI or multiple nodes.
 
 Each process handles a round-robin subset of snapshots, sequentially, and retains
-its own cumulative central moments. The parent merges central sums through order
-four, preserving the equal weight of every particle/timestep pair. It does not
-average workers' skewness or kurtosis. The parent alone writes the final output,
+its own cumulative mean and second central sum. The parent merges these
+accumulators, preserving the equal weight of every particle/timestep pair and
+within-snapshot scatter. Individual load samples are combined before PDF binning. The parent alone writes the final output,
 after all workers succeed. Provenance stays in configured snapshot order;
 floating-point grouping can cause small differences from serial results. Worker
 failures abort the run without publishing a final file.
@@ -221,7 +224,7 @@ For each configured saved index, the processor:
    simultaneously.
 4. For each selected yielded component, loops over particles. Samples the closure
    at the particle-centered map, averages theta first for axisymmetric maps, then
-   updates pointwise count, mean, and central sums through order four. There is
+   updates pointwise count, mean, and the second central sum. There is
    no Python loop over the individual interpolation points.
 5. Merges that particle distribution into the cumulative ensemble over all
    particle/timestep pairs, preserving within-snapshot scatter.
@@ -251,7 +254,7 @@ Output metadata records the actual backend in `execution.map_backend`.
 
 The fused kernel parallelizes over map locations. Each location loops through
 particles in their original order, interpolates eight corners, and immediately
-updates mean and central sums through order four in local scalars. It writes the
+updates mean and the second central sum in local scalars. It writes the
 accumulator once, avoiding per-particle map and moment-update temporary arrays.
 Only small 1D periodic stencils are precomputed. Double precision, invalid-support
 rules, and equal particle weights are preserved; fast-math is disabled. The first
@@ -299,10 +302,11 @@ Compare the current NumPy Cartesian mapper with the warmed fused Numba mapper:
 PYTHONPATH=toolchain python misc/volume_filter/benchmark_acceleration.py --grid 400 --points 100 --particles 95 --workers 8 --repeats 3
 ```
 
-This checks counts, central sums, and all four statistics, alternates measurement
+This checks counts, second central sums, mean, and variance, alternates measurement
 order, and reports first-call setup separately. It measures one scalar field's
 mapping only; it does not measure DNS I/O, closure FFTs, final output, or the
-complete production runtime.
+complete production runtime. The historical timing numbers below refer to the
+previous four-statistic implementation, rather than a new mean/variance benchmark.
 
 A local three-repeat run with a 400^3 source grid, 95 particles, 100^3 maps,
 and eight Numba threads measured median times of 8.75 s (NumPy) and 0.50 s
@@ -317,17 +321,14 @@ complete 400^3 production runtime or Delta filesystem performance.
 A 100^3 map contains one million locations, 1000 times a 10^3 map. Mapping cost
 still scales with map locations x particles x selected components x filter
 widths x snapshots. All 59 scalar outputs are selected if `fields` is omitted.
-At 100^3 locations, the cumulative accumulator uses about 48 MB per scalar
-component/filter, or 2.8 GB for all 59 outputs at one filter width, excluding
-DNS/work arrays and temporaries. The final NPZ stores four arrays per
-component/filter: 32 MB each, or 1.9 GB for all 59. This is about 88 percent less
-array storage than the earlier 34-array output, while removing the separate
-snapshot-average accumulators halves persistent statistics memory. Output is
-written only once at the end. These figures use decimal GB and scale linearly
-with filter count. Restrict `fields` to needed components to reduce mapping work,
-statistics memory, and final output size. With multiple snapshot workers, the
-2.8 GB accumulator is replicated per worker/filter and once more in the parent
-during reduction; it is not shared memory.
+At 100^3 locations, the cumulative accumulator now uses about 32 MB per scalar
+component/filter (count, weight, mean, M2), or 1.89 GB for all 59 outputs at one
+filter width, excluding DNS/work arrays and temporaries. Each component/filter
+saves two float64 map arrays, about 16 MB total at this map size, or 0.94 GB for
+all 59 fields. Removing M3/M4 reduces map-accumulator array storage by one third
+and halves primary statistic output relative to the previous four-statistic
+format. This saves statistical bookkeeping; DNS reads, traction reconstruction,
+FFT filtering, and interpolation are still required.
 
 ## Closure conventions
 
@@ -415,9 +416,9 @@ subgrid lubrication or contact-film stresses. Finite statistics describe the
 chosen reconstruction and must be checked under grid refinement.
 
 Every final NPZ records the policy and ordered per-snapshot support counts under
-`metadata["reconstruction"]`. This is additive metadata; the four primary
-statistics, field keys, equal realization weights, and optional histories are
-unchanged. Counts describe geometry once per snapshot, rather than summing
+`metadata["reconstruction"]`. Support metadata is separate from the primary
+mean/variance statistics, field keys, equal realization weights, and optional
+histories. Counts describe geometry once per snapshot, rather than summing
 repeated derivative calls or filter widths:
 
 | Per-snapshot entry | Meaning |
@@ -542,45 +543,42 @@ with N valid pairs, the population estimators are
 
 \f[
 \mu = \frac{1}{N}\sum_{t,p}X_{p,t}, \qquad
-c_r = \frac{1}{N}\sum_{t,p}(X_{p,t}-\mu)^r, \quad r=2,3,4.
+c_2 = \frac{1}{N}\sum_{t,p}(X_{p,t}-\mu)^2.
 \f]
 
-The saved statistics are mean, population variance c2, skewness c3/c2^(3/2),
-and Pearson kurtosis c4/c2^2. A Gaussian population has kurtosis 3. Variance uses
-N rather than N-1; the statistics are empirical population estimators without
-finite-sample bias corrections.
+The saved statistics are mean and population variance c2. Variance uses N rather
+than N-1; these are empirical population estimators without finite-sample bias
+corrections. Third and fourth central sums, skewness, and kurtosis are no longer
+computed or stored, including in the fused Numba mapping and worker reduction.
 
 Particle realizations are accumulated before particle averaging. Snapshot batches
-are merged using internal counts, means, and all three central sums M2, M3, M4;
+are merged using internal counts, weights, means, and second central sums M2;
 merging only particle-average maps would lose within-snapshot scatter. These
 pairwise formulas follow
 [Pebay, SAND2008-6212](https://doi.org/10.2172/1028931). Accumulators use float64,
-with int64 valid-realization counts, and memory remains independent of the number
-of snapshots when diagnostics are disabled. Counts, weights, and central sums are needed internally for stable
+with int64 valid-realization counts. Map-accumulator memory remains independent
+of the number of snapshots; load-PDF samples have the storage cost stated above. Counts, weights, and central sums are needed internally for stable
 accumulation; selected diagnostic counts and central sums can optionally be retained. Final output entries are streamed
 instead of duplicating all derived arrays in memory.
 
-The version-3 NPZ uses **field, statistic, filter index** ordering:
+The version-4 NPZ uses **field, statistic, filter index** ordering:
 
 | Example key | Meaning |
 |---|---|
 | `F_x.mean.sigma0` | Ensemble mean of F_x at the first configured filter width |
 | `F_x.variance.sigma0` | Population variance of F_x |
-| `F_x.skewness.sigma0` | Standardized third central moment of F_x |
-| `F_x.kurtosis.sigma0` | Pearson kurtosis of F_x |
 | `R_u_xy.mean.sigma1` | Mean xy momentum-flux closure at the second filter width |
 
-Each selected map field/filter has these four statistics. The file additionally
-contains `metadata` and the scalar particle-force/torque statistics described
-below. No `.time`, `.pooled`, raw moments, central moments, counts,
-weights, central sums, or excess-kurtosis arrays are saved. All statistics use
-the equally weighted particle/timestep ensemble. With all 59 fields and one
-filter width, the NPZ has 285 keys including metadata, 24 saved particle-load
-scalars, and 24 reconstructed hydrodynamic particle-load scalars (261 keys
-before hydrodynamic loads were added).
+Each selected map field/filter has these two statistics. The file additionally
+contains `metadata`, the scalar load statistics, and load-PDF arrays described
+below. No `.time`, `.pooled`, raw-moment, or higher-order statistic arrays are
+saved. Diagnostic counts/M2 and PDF bin counts are distinct from map statistics.
+With all 59 map fields and one filter width, the NPZ has 203 keys: metadata,
+118 map arrays, 24 load mean/variance scalars, and 60 load-PDF arrays, before
+optional diagnostic histories.
 
 An unsupported location has NaN statistics. A constant realization sequence has
-zero variance and NaN skewness/kurtosis. Invalid samples are excluded separately
+zero variance. Invalid samples are excluded separately
 at each map location, so the internal realization count may vary spatially.
 For axisymmetric maps, one realization is a particle's ring average at one
 timestep; azimuthal points are not additional realizations. Statistics therefore
@@ -643,11 +641,11 @@ The same final NPZ additionally contains:
 | `diagnostics.steps` | (snapshot,), configured saved file indices |
 | `diagnostics.F_x.sigma0.count` | (snapshot, probe), valid particle counts |
 | `diagnostics.F_x.sigma0.mean` | (snapshot, probe), particle mean before time pooling |
-| `diagnostics.F_x.sigma0.m2`, `.m3`, `.m4` | Unnormalized central sums within each snapshot |
+| `diagnostics.F_x.sigma0.m2` | Unnormalized second central sum within each snapshot |
 | `diagnostics.particle_force_x.mean` | (snapshot, 1), particle-average saved force |
 | `diagnostics.particle_hydro_force_x.mean` | (snapshot, 1), particle-average reconstructed hydrodynamic force |
 
-Every history has count, mean, m2, m3, and m4 arrays. The count remains int64;
+Version-2 diagnostic histories have only count, mean, and m2 arrays. The count remains int64;
 central sums and means remain float64. Empty support has zero count and must not
 be interpreted as a zero-valued observation. Main population variance is not the
 variance of the snapshot means. Counts and sums preserve the within-snapshot
@@ -697,7 +695,7 @@ Controller targets alone do not establish stationarity of the closure field.
 
 For every field/probe, the report contains:
 
-- Pooled mean, population variance, skewness, and Pearson kurtosis.
+- Pooled mean and population variance.
 - An autocorrelation and integral time for each statistic's estimator influence.
 - Effective sample size, standard error, and an approximate confidence interval.
 - Complete-distribution block-jackknife estimates over several block lengths.
@@ -708,9 +706,9 @@ For every field/probe, the report contains:
 
 The mean influence at time t is proportional to
 `n_t * (mean_t - pooled_mean) / average(n_t)`. Thus varying particle counts and
-empty-support snapshots remain on the original regular time axis. Skewness and
-kurtosis use the corresponding delta-method influences, including the dependence
-on the estimated mean and variance. No particle-independence assumption is made.
+empty-support snapshots remain on the original regular time axis. The variance
+influence includes both within-snapshot M2 and displacement from the pooled
+mean. No particle-independence assumption is made.
 Deleting a time block removes all its particles together and recomputes the full
 pooled statistic from central sums, including within-snapshot scatter. At least
 eight complete blocks are required; trailing snapshots that do not form a full
@@ -763,14 +761,12 @@ particle count changes between snapshots. No particle averaging precedes the
 moment calculation. Independent snapshot workers merge the same central moments
 used for map statistics.
 
-There are **24 scalar entries**, four statistics for each component:
+There are **12 scalar entries**, mean and variance for each component:
 
 | Example key | Meaning |
 |---|---|
 | `particle_force_y.mean` | Mean saved y force across all particle/timestep pairs |
 | `particle_force_y.variance` | Population variance of that force |
-| `particle_force_y.skewness` | Standardized third central moment |
-| `particle_force_y.kurtosis` | Pearson kurtosis |
 | `particle_torque_z.mean` | Mean saved z torque |
 
 The component names are `particle_force_x/y/z` and `particle_torque_x/y/z`.
@@ -779,13 +775,13 @@ obtain a Python scalar. These quantities have no spatial-map coordinates and no
 filter dependence, so their keys have no `.sigma` suffix. They are accumulated
 once per snapshot, independently of the map's `fields` selection and number of
 filter widths. No additional input files or configuration options are needed.
-Only the same four statistics are saved, in the single final NPZ file.
+Mean and variance are saved in the single final NPZ file, together with the
+component PDFs below.
 
 The values retain the saved units and sign conventions. They are not
 nondimensional drag/lift coefficients or reconstructed surface-source integrals.
 MFC's saved force can include collision/body-force contributions and has the
-stage-timing considerations noted above. Constant components have zero variance
-and NaN skewness/kurtosis. Metadata's `particle_statistics` describes the source,
+stage-timing considerations noted above. Constant components have zero variance. Metadata's `particle_statistics` describes the source,
 record columns, scalar key format, and total realization count. Older version-3
 files and converted version-2 files lack these newly added entries.
 
@@ -814,19 +810,17 @@ force can average to zero while this hydrodynamic force remains nonzero.
 |---|---|
 | `particle_hydro_force_x.mean` | Mean reconstructed fluid-on-particle x force |
 | `particle_hydro_force_x.variance` | Population variance across particle/timestep pairs |
-| `particle_hydro_force_x.skewness` | Standardized third central moment |
-| `particle_hydro_force_x.kurtosis` | Pearson kurtosis |
 | `particle_hydro_torque_z.mean` | Mean reconstructed hydrodynamic centroid torque |
 
 The six components are `particle_hydro_force_x/y/z` and
-`particle_hydro_torque_x/y/z`, adding **24 scalar entries**. For the supplied
+`particle_hydro_torque_x/y/z`, adding **12 scalar entries**. For the supplied
 x-directed cases, `particle_hydro_force_x` is signed streamwise hydrodynamic
 drag. Components remain in fixed laboratory axes; no magnitude, slip-direction
 projection, or drag coefficient is inferred. Force and torque use the simulation's
 force and force-times-length units (N and N m for SI input).
 
 The processor computes each particle's load separately, then accumulates mean,
-population variance, skewness, and Pearson kurtosis over equally weighted
+and population variance over equally weighted
 particle/timestep pairs, including within-snapshot scatter. Each load is counted
 once per snapshot, regardless of the number of filter widths or mapped `fields`
 selection. These scalar keys have no `.sigma` suffix. No new configuration or
@@ -848,10 +842,86 @@ origin, exclusions, and realization count separately from saved-load metadata.
 Existing NPZ files cannot acquire these loads from saved net-force moments alone:
 rerun postprocessing on the fluid/particle restarts, using a new output filename.
 
-Plotting loops should handle scalars before parsing map keys or slicing arrays:
+### Particle force and torque probability density functions
+
+The final NPZ also contains histogram probability-density estimates for every
+x/y/z force and torque component, separately for saved net loads and reconstructed
+hydrodynamic loads. For example:
+
+| Key | Shape and meaning |
+|---|---|
+| `particle_hydro_force_x.pdf.bin_edges` | (bins+1,), signed force-bin boundaries |
+| `particle_hydro_force_x.pdf.counts` | (bins,), int64 counts of individual particle/timestep samples |
+| `particle_hydro_force_x.pdf.density` | (bins,), count / (finite sample count * bin width) |
+| `particle_hydro_force_x.pdf.sample_count` | scalar int64, total finite samples |
+| `particle_hydro_force_x.pdf.samples` | (sample_count,), individual finite load samples for rebinning or KDE |
+
+The same suffixes apply to all `particle_hydro_force_x/y/z`,
+`particle_hydro_torque_x/y/z`, `particle_force_x/y/z`, and
+`particle_torque_x/y/z` components. Hydrodynamic PDFs exclude particle
+body/control/contact loads. Saved-load PDFs retain whatever contributions MFC
+stored; their net force can be near zero under control.
+
+Each particle/timestep pair contributes one sample before any particle average.
+Bins are selected from the full finite ensemble range of each component after
+all snapshot workers finish. No tails are clipped, no snapshot means or PDFs are
+averaged, and extra Gaussian filter widths do not duplicate observations. PDF
+arrays have no filter suffix. For a nonempty histogram,
+`sum(density * diff(bin_edges)) == 1`, including unequal bin widths. Density has
+inverse-force or inverse-torque units; it is not a bin probability or a drag
+coefficient.
+
+The optional input `"particle_pdf_bins": 100` selects the number of uniformly
+spaced bins for nonconstant components; 100 is the default, so existing configs
+work unchanged. Floating-point duplicate edges are removed when fluctuations
+are too small to represent every requested bin. A strictly constant component
+is flagged as `point_mass: true` with its `constant_value` under
+`metadata["particle_pdfs"]["fields"][field]`. Its normalized one-bin
+representation has an arbitrary display width; plot a vertical line at the
+constant value instead of interpreting it as a smooth density. Empty support
+has zero counts and NaN density. Finite/excluded sample counts and actual bin
+counts are recorded in metadata.
+
+Only the small 12-component load sample arrays are retained until final binning,
+at 96 bytes per particle/timestep pair; per-snapshot closure maps are still
+discarded. Building the final per-component arrays can temporarily duplicate
+that small load-sample storage. This gives exact
+histogram counts and matching serial/parallel bins without rereading the DNS
+fields. The finite load samples are also saved under `.pdf.samples`, so bin
+widths, common comparison bins, or a kernel-density estimate can be chosen later
+without recomputing the closures. PDFs are generated even when `diagnostics` is absent or
+`diagnostics.particle_loads` is false.
+
+For a nonconstant component, plot its probability density using the stored
+physical bin boundaries:
 
 ```python
-if key == "metadata":
+import matplotlib.pyplot as plt
+import numpy as np
+
+with np.load("closure_statistics.npz", allow_pickle=False) as data:
+    field = "particle_hydro_force_x"
+    plt.stairs(
+        data[field + ".pdf.density"],
+        data[field + ".pdf.bin_edges"],
+        color=plt.get_cmap("RdBu")(0.1),
+    )
+plt.xlabel("Hydrodynamic x force [simulation force units]")
+plt.ylabel("Probability density [inverse force units]")
+plt.savefig("hydrodynamic_force_x_pdf.png", dpi=200, bbox_inches="tight")
+```
+
+Repeat with the y/z components and `particle_hydro_torque_x/y/z` for the six
+load distributions of a case. When comparing cases, use each file's actual
+bin boundaries and density values, rather than bin indices or raw counts.
+Existing mean/variance scalars cannot reconstruct a PDF; rerun postprocessing
+against the original restart files and use a new output filename.
+
+Plotting loops should skip `.pdf.` arrays and handle scalars before parsing map
+keys or slicing arrays:
+
+```python
+if key == "metadata" or ".pdf." in key:
     continue
 F = data[key]
 if F.ndim == 0:
@@ -868,8 +938,6 @@ with np.load("closure_statistics.npz", allow_pickle=False) as data:
     metadata = json.loads(str(data["metadata"]))
     mean = data["F_x.mean.sigma0"]
     variance = data["F_x.variance.sigma0"]
-    skewness = data["F_x.skewness.sigma0"]
-    kurtosis = data["F_x.kurtosis.sigma0"]
     mean_particle_force_y = data["particle_force_y.mean"].item()
     mean_particle_torque_z = data["particle_torque_z.mean"].item()
     mean_hydrodynamic_drag = data["particle_hydro_force_x.mean"].item()
@@ -882,7 +950,7 @@ or closure calculations:
 PYTHONPATH=toolchain python -m mfc.volume_filter.compact old_statistics.npz compact_statistics.npz
 ```
 
-The converter copies only the four pooled statistics, renames their keys, and
+The converter copies only pooled mean and variance, renames their keys, and
 updates metadata. It streams one array at a time, leaves the original intact,
 refuses an existing destination, and rejects incomplete runs or incompatible
 weighting. Existing plotting scripts must switch to the new key names.
@@ -892,19 +960,19 @@ weighting. Existing plotting scripts must switch to the new key names.
 Run the focused suite without compiling MFC:
 
 ```bash
-PYTHONPATH=toolchain python -m unittest mfc.volume_filter.test_volume_filter mfc.volume_filter.test_moments mfc.volume_filter.test_parallel mfc.volume_filter.test_acceleration mfc.volume_filter.test_diagnostics mfc.volume_filter.test_collisions -v
+PYTHONPATH=toolchain python -m unittest discover -s toolchain/mfc/volume_filter -t toolchain -p "test_*.py" -v
 ```
 
 It exercises Fourier-mode attenuation, filtered momentum and energy identities,
 fluid-only differences, cubic mesh construction, affine interpolation, periodic
 particle registration, conservative deposition, analytic
 surface-force/power integrals, map statistics, shared/sharded/Fortran-record input,
-and a single final write after all snapshots complete. Higher-moment
-tests compare streamed and unevenly grouped data with direct sample statistics,
-including nonzero skewness, large mean offsets, missing/constant data, variable
+and a single final write after all snapshots complete. Mean/variance tests
+compare streamed and unevenly grouped data with direct sample statistics,
+including asymmetric samples, large mean offsets, missing/constant data, variable
 particle counts, irregular file timestamps, step-only input, ignored legacy times,
 final statistics serialization, compact-output key sets, legacy-file conversion,
-and failure cleanup. Spawned-worker tests compare all four final statistics with
+and failure cleanup. Spawned-worker tests compare mean and variance with
 serial results across multiple filters and changing particle counts, check ordered
 provenance, and exercise worker failure without a final write. Accelerator tests
 compare NumPy/Numba maps across periodic boundaries, invalid and constant data,

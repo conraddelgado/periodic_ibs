@@ -10,7 +10,7 @@ from scipy.stats import norm
 from .diagnostics import ARRAYS, PREFIX
 from .maps import Moments
 
-STATISTICS = ("mean", "variance", "skewness", "kurtosis")
+STATISTICS = ("mean", "variance")
 MIN_SAMPLES = 32
 
 
@@ -36,7 +36,7 @@ def validate_history(history, snapshots):
         if value.shape != shape or not np.all(np.isfinite(value)):
             raise ValueError(f"Inconsistent or nonfinite diagnostic {name}")
     count = history["count"]
-    if np.any(count < 0) or np.any(count != np.floor(count)) or np.any(history["m2"] < 0) or np.any(history["m4"] < 0):
+    if np.any(count < 0) or np.any(count != np.floor(count)) or np.any(history["m2"] < 0):
         raise ValueError("Invalid diagnostic counts or central sums")
 
 
@@ -65,19 +65,7 @@ def influence_series(history, total):
     denominator = np.where(count > 0, count, 1)
     delta = history["mean"] - total.mean
     second = (history["m2"] + count * delta**2) / denominator
-    third = (history["m3"] + 3 * delta * history["m2"] + count * delta**3) / denominator
-    fourth = (history["m4"] + 4 * delta * history["m3"] + 6 * delta**2 * history["m2"] + count * delta**4) / denominator
-    variance, central3, central4 = (total.central_moment(order) for order in (2, 3, 4))
-    safe_variance = np.where(variance > 0, variance, 1)
-    variance_influence = second - variance
-    third_influence = third - central3 - 3 * variance * delta
-    fourth_influence = fourth - central4 - 4 * central3 * delta
-    values = {
-        "mean": delta,
-        "variance": variance_influence,
-        "skewness": third_influence / safe_variance**1.5 - 1.5 * central3 * variance_influence / safe_variance**2.5,
-        "kurtosis": fourth_influence / safe_variance**2 - 2 * central4 * variance_influence / safe_variance**3,
-    }
+    values = {"mean": delta, "variance": second - total.variance}
     average_count = count.mean(axis=0)
     weight = count / np.where(average_count > 0, average_count, 1)
     return {name: np.where(count > 0, weight * value, 0) for name, value in values.items()}

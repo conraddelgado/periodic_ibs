@@ -26,7 +26,7 @@ def measure(grid, mapper, field, centers, reference):
         interpolation += perf_counter() - start
         start = perf_counter()
         if reference:
-            result._combine(value, 1.0, 1, 0.0, 0.0, 0.0)  # Original general merge path.
+            result._combine(value, 1.0, 1, 0.0)  # Original general merge path.
         else:
             result.update(value)
         updates += perf_counter() - start
@@ -52,7 +52,7 @@ def main():
         for reference in (True, False) if repeat % 2 == 0 else (False, True):
             results[reference], timing = measure(grid, mapper, field, centers, reference)
             timings[reference].append(timing)
-        for name in ("count", "weight", "mean", "m2", "m3", "m4"):
+        for name in ("count", "weight", "mean", "m2"):
             np.testing.assert_allclose(getattr(results[False], name), getattr(results[True], name), rtol=1e-11, atol=1e-12)
     print(f"Map: {mapper.shape}; particles: {args.particles}; scalar fields: 1; repeats: {args.repeats}")
     for reference in (True, False):

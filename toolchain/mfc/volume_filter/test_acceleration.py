@@ -38,7 +38,7 @@ class AccelerationTests(unittest.TestCase):
             self.assertEqual(get_num_threads(), previous)
             for name in ("count", "weight"):
                 assert_array_equal(getattr(result, name), getattr(reference, name))
-            for name in ("mean", "m2", "m3", "m4", "variance", "skewness", "kurtosis"):
+            for name in ("mean", "m2", "variance"):
                 assert_allclose(getattr(result, name), getattr(reference, name), rtol=1e-10, atol=1e-11, equal_nan=True, err_msg=name)
         one = ParticleMap(grid, dict(options, backend="numba")).particles(field, states[:1])
         self.assertEqual(one.count[2, 2, 2], 1)

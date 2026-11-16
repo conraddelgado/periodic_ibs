@@ -42,7 +42,7 @@ def main():
             start = perf_counter()
             results[backend] = mappers[backend].particles(field, states)
             timings[backend].append(perf_counter() - start)
-        for name in ("count", "weight", "mean", "m2", "m3", "m4", "variance", "skewness", "kurtosis"):
+        for name in ("count", "weight", "mean", "m2", "variance"):
             np.testing.assert_allclose(getattr(results["numba"], name), getattr(results["numpy"], name), rtol=1e-10, atol=1e-11, equal_nan=True, err_msg=name)
         del results
     print(f"Source grid: {grid.shape}; map: {(args.points,) * 3}; particles: {args.particles}; requested Numba threads: {args.workers}; repeats: {args.repeats}")
